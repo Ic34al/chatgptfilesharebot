@@ -42,6 +42,7 @@ query ($ids: [Int], $page: Int) {
     pageInfo { hasNextPage }
     media(id_in: $ids, type: ANIME) {
       %s
+      description(asHtml: false)
       relations { edges { relationType node { type %s } } }
     }
   }
@@ -69,6 +70,23 @@ class _RateLimiter:
             self._next = max(now, self._next) + self.interval
 
 
+def short_synopsis(text, limit: int = 220):
+    """AniList description → short plain-text synopsis (None if missing)."""
+    import re
+    if not text or not isinstance(text, str):
+        return None
+    t = re.sub(r"<[^>]+>", " ", text)
+    t = re.sub(r"\(Source:[^)]*\)|\[Written by[^\]]*\]", " ", t, flags=re.I)
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return None
+    if len(t) <= limit:
+        return t
+    cut = t[:limit]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    return (cut[: end + 1] if end > limit * 0.5 else cut.rsplit(" ", 1)[0] + "…").strip()
+
+
 def parse_media(m: dict) -> AnimeInfo:
     nxt = m.get("nextAiringEpisode") or {}
     cover = m.get("coverImage") or {}
@@ -81,6 +99,7 @@ def parse_media(m: dict) -> AnimeInfo:
         season_year=m.get("seasonYear"), episodes=m.get("episodes"), id_mal=m.get("idMal"),
         cover_url=cover.get("extraLarge") or cover.get("large"),
         next_episode=nxt.get("episode"),
+        synopsis=short_synopsis(m.get("description")),
     )
     for edge in ((m.get("relations") or {}).get("edges") or []):
         node = edge.get("node") or {}

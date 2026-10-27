@@ -30,6 +30,7 @@ class AnimeInfo:
     id_mal: Optional[int] = None
     cover_url: Optional[str] = None
     next_episode: Optional[int] = None
+    synopsis: Optional[str] = None        # only from AniList's own description
     sequels: List["AnimeInfo"] = field(default_factory=list)
 
     def to_doc(self) -> Dict:
@@ -38,6 +39,7 @@ class AnimeInfo:
             "synonyms": self.synonyms[:20], "status": self.status, "format": self.format,
             "season": self.season, "season_year": self.season_year, "total_episodes": self.episodes,
             "id_mal": self.id_mal, "cover_url": self.cover_url,
+            **({"synopsis": self.synopsis} if self.synopsis else {}),
         }
 
 

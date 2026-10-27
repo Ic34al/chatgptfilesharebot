@@ -50,3 +50,40 @@ FSUB, no broadcast and no user collection, so these were **built new** rather th
    Python 3.11; a future move to a maintained fork (e.g. Pyrofork/Kurigram) is recommended.
 6. `runtime.txt` is deprecated on Heroku; replaced by `.python-version` (`3.11`). Python 3.11 is
    pinned deliberately: Heroku's default for new apps is 3.14, which Pyrogram 2.0.106 was not built for.
+
+
+---
+
+## Second audit — full automatic pipeline (27 Oct 2026, branch `feature/anime-soul-full-pipeline`)
+
+Inspected `main` after PR #1 (all 93 tests passing) and the reference
+[MatizTech/Auto-Anime-Bot](https://github.com/MatizTech/Auto-Anime-Bot). The reference follows
+RSS release feed → torrent download → FFmpeg encode → Telegram upload → index-channel post.
+Its *structure* was reused (feed monitor, encode stage, upload, post); its torrent/third-party
+release sources were **not** — only feeds and files you are authorized to redistribute are supported.
+
+### Already working (kept unchanged)
+AniList/Jikan schedule monitor in IST · unique episode keys and MongoDB leases · authorized sources
+(`/attach` inbox, JSON partner feed, local library) with SSRF-safe streaming downloads · storage upload
+with saved `chat_id`/`message_id` · one post per episode with **GET EPISODE** →
+`https://t.me/<bot>?start=<token>` (format from `deeplink.build_link`, decoded by the existing
+`/start` handler; legacy share links untouched) · FSUB with join requests and TRY AGAIN · admin
+commands · dry run · ROLE=all/bot/pipeline · graceful shutdown.
+
+### Missing or weak → fixed
+| Gap | Fix |
+|---|---|
+| No FFmpeg stage — only an optional ffprobe duration check | New `anime_soul/processing.py`: ffprobe validation (video + audio streams, duration, size, format), `PROCESS_MODE=auto` remuxes only when lossless, optional transcode, timeouts, disk checks; new `processing` state |
+| FFmpeg not reliably available on Heroku | `app.json` uses Heroku's `activestorage-preview` buildpack (ffmpeg + ffprobe); startup alert and `/status` line if missing |
+| No RSS/Atom support (the reference's release mechanism) | `rss_feed` source (`/sources add_rss`), defusedxml parser, torrents/magnets ignored |
+| Releases only from AniList | Authorized feeds also create episodes (`FEED_DETECT_RELEASES`), deduped, no backfill |
+| "No source" looked like a silent wait | `SOURCE_NOT_CONFIGURED` status, owner alert, shown in `/queue` and `/status` |
+| Two monitors if ROLE=all and the uploader dyno both ran | MongoDB monitor leader lock |
+| Dry run checked only before acquiring; an already-queued job could still upload | Dry run/pause re-checked before download, upload and post |
+| `/testupload publish` posted straight to the public channel | Needs `TEST_CHANNEL_ID`, or an explicit `publish live` |
+| `/testupload` only copied a Telegram message | `/testupload full` runs download → FFmpeg → upload |
+| `DRY_RUN` defaulted to false when unset | Defaults to **true** |
+| No `/queue`; `/help` didn't list admin commands | Added |
+| Post lacked synopsis/status; quality came from the feed label | AniList synopsis (only when present), release status, FFprobe-verified quality |
+| Bad numeric config gave a bare `ValueError` | `ConfigError` naming the variable (never its value) |
+| Admin alerts/errors could echo secrets in exception text | Redaction applied to alerts and command errors |

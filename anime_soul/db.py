@@ -58,6 +58,29 @@ class AnimeDB:
     async def set_setting(self, key: str, value: Any) -> None:
         await self.settings.update_one({"_id": key}, {"$set": {"value": value, "updated_at": utcnow()}}, upsert=True)
 
+    async def acquire_lock(self, name: str, ttl_seconds: int, owner: str = None) -> bool:
+        """Leader lock (one release monitor across all dynos). Re-entrant for the same owner."""
+        owner = owner or WORKER_ID
+        now = utcnow()
+        until = now + timedelta(seconds=ttl_seconds)
+        try:
+            doc = await self.settings.find_one_and_update(
+                {"_id": f"lock:{name}", "$or": [{"owner": owner}, {"until": {"$lt": now}}]},
+                {"$set": {"owner": owner, "until": until, "updated_at": now}}, upsert=True,
+                return_document=ReturnDocument.AFTER)
+        except DuplicateKeyError:     # someone else holds a live lock
+            return False
+        return bool(doc and doc.get("owner") == owner)
+
+    async def release_lock(self, name: str, owner: str = None) -> None:
+        await self.settings.delete_one({"_id": f"lock:{name}", "owner": owner or WORKER_ID})
+
+    async def lock_holder(self, name: str):
+        doc = await self.settings.find_one({"_id": f"lock:{name}"})
+        if not doc or _aware(doc.get("until")) < utcnow():
+            return None
+        return doc.get("owner")
+
     async def is_paused(self) -> bool:
         return bool(await self.get_setting("paused", False))
 
@@ -205,6 +228,9 @@ class AnimeDB:
     async def list_pending(self, limit: int = 30) -> List[dict]:
         return await self.episodes.find(
             {"state": {"$nin": [M.PUBLISHED, M.SCHEDULED]}}).sort("airing_at", 1).to_list(length=limit)
+
+    async def list_by_states(self, states, limit: int = 30) -> List[dict]:
+        return await self.episodes.find({"state": {"$in": list(states)}}).sort("airing_at", 1).to_list(length=limit)
 
     async def list_upcoming(self, limit: int = 20) -> List[dict]:
         return await self.episodes.find({"state": M.SCHEDULED}).sort("airing_at", 1).to_list(length=limit)

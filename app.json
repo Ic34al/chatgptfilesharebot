@@ -1,27 +1,113 @@
 {
   "name": "anime-soul-bot",
-  "description": "ANIME SOUL: Telegram file-share bot plus automatic anime release monitor, authorized uploader, channel poster and FSUB delivery.",
+  "description": "ANIME SOUL: Telegram file-share bot plus automatic release monitor, authorized source downloader, FFmpeg processing, storage uploader, channel poster and FSUB delivery.",
   "repository": "https://github.com/Ic34al/chatgptfilesharebot",
-  "buildpacks": [{"url": "heroku/python"}],
+  "buildpacks": [
+    {
+      "url": "https://github.com/heroku/heroku-buildpack-activestorage-preview"
+    },
+    {
+      "url": "heroku/python"
+    }
+  ],
   "formation": {
-    "worker": {"quantity": 1, "size": "basic"},
-    "uploader": {"quantity": 0, "size": "basic"}
+    "worker": {
+      "quantity": 1,
+      "size": "basic"
+    },
+    "uploader": {
+      "quantity": 0,
+      "size": "basic"
+    }
   },
   "env": {
-    "API_ID": {"description": "Telegram API ID from my.telegram.org", "required": true},
-    "API_HASH": {"description": "Telegram API hash from my.telegram.org", "required": true},
-    "BOT_TOKEN": {"description": "BotFather bot token", "required": true},
-    "MONGODB_URI": {"description": "MongoDB connection URI (e.g. MongoDB Atlas)", "required": true},
-    "DATABASE_NAME": {"description": "MongoDB database name", "value": "file_share_bot"},
-    "OWNER_ID": {"description": "Your numeric Telegram user ID", "required": true},
-    "ADMIN_IDS": {"description": "Extra admin IDs, comma-separated", "required": false},
-    "STORAGE_CHANNEL_ID": {"description": "Private storage channel ID (-100...)", "required": true},
-    "POST_CHANNEL_ID": {"description": "ANIME SOUL announcement channel ID (-100...)", "required": true},
-    "CHANNEL_NAME": {"description": "Channel name used in captions", "value": "ANIME SOUL"},
-    "FSUB_CHANNELS": {"description": "Required channels, comma-separated IDs or @usernames", "required": false},
-    "FSUB_JOIN_REQUEST": {"description": "Accept pending join requests as subscribed", "value": "false"},
-    "ROLE": {"description": "all | bot | pipeline", "value": "all"},
-    "DRY_RUN": {"description": "Start without uploading/posting", "value": "true"},
-    "ALLOWED_SOURCE_HOSTS": {"description": "Hosts of authorized sources, comma-separated", "required": false}
+    "API_ID": {
+      "description": "Telegram API ID from my.telegram.org",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Telegram API hash from my.telegram.org",
+      "required": true
+    },
+    "BOT_TOKEN": {
+      "description": "BotFather bot token",
+      "required": true
+    },
+    "MONGODB_URI": {
+      "description": "MongoDB connection URI (e.g. MongoDB Atlas)",
+      "required": true
+    },
+    "DATABASE_NAME": {
+      "description": "MongoDB database name",
+      "value": "file_share_bot"
+    },
+    "OWNER_ID": {
+      "description": "Your numeric Telegram user ID",
+      "required": true
+    },
+    "ADMIN_IDS": {
+      "description": "Extra admin IDs, comma-separated",
+      "required": false
+    },
+    "STORAGE_CHANNEL_ID": {
+      "description": "Private storage channel ID (-100...)",
+      "required": true
+    },
+    "POST_CHANNEL_ID": {
+      "description": "ANIME SOUL announcement channel ID (-100...)",
+      "required": true
+    },
+    "CHANNEL_NAME": {
+      "description": "Channel name used in captions",
+      "value": "ANIME SOUL"
+    },
+    "FSUB_CHANNELS": {
+      "description": "Required channels, comma-separated IDs or @usernames",
+      "required": false
+    },
+    "FSUB_JOIN_REQUEST": {
+      "description": "Accept pending join requests as subscribed",
+      "value": "false"
+    },
+    "ROLE": {
+      "description": "all | bot | pipeline",
+      "value": "all"
+    },
+    "DRY_RUN": {
+      "description": "true = detect and report only; nothing is uploaded or posted. Set false when ready.",
+      "value": "true"
+    },
+    "ALLOWED_SOURCE_HOSTS": {
+      "description": "Hosts of authorized sources, comma-separated",
+      "required": false
+    },
+    "TEST_CHANNEL_ID": {
+      "description": "Optional private channel for /testupload publish test posts",
+      "required": false
+    },
+    "PROCESS_MODE": {
+      "description": "auto (remux only when lossless, never re-encode) | copy | transcode | off",
+      "value": "auto"
+    },
+    "FFMPEG_REQUIRED": {
+      "description": "Refuse to upload files FFprobe cannot validate",
+      "value": "true"
+    },
+    "MAX_OUTPUT_HEIGHT": {
+      "description": "0 = keep resolution; e.g. 720 transcodes larger files (CPU heavy)",
+      "value": "0"
+    },
+    "DRY_RUN_PROCESS": {
+      "description": "In dry run, also download + FFmpeg-check files (still never uploads)",
+      "value": "false"
+    },
+    "POLL_INTERVAL_SECONDS": {
+      "description": "Release monitor interval",
+      "value": "600"
+    },
+    "MAX_CONCURRENT_JOBS": {
+      "description": "Episodes processed at the same time",
+      "value": "1"
+    }
   }
 }

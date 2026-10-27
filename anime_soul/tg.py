@@ -9,6 +9,8 @@ from typing import Any, Awaitable, Callable, Dict, Iterable
 
 from pyrogram.errors import FloodWait, RPCError
 
+from .logging_setup import redact
+
 log = logging.getLogger(__name__)
 
 
@@ -43,7 +45,7 @@ class Notifier:
             self._last[key] = now
         for admin in self.admin_ids:
             try:
-                await call_with_flood(self.client.send_message, admin, text[:4000],
+                await call_with_flood(self.client.send_message, admin, redact(text)[:4000],
                                       disable_web_page_preview=True)
             except RPCError as e:
                 log.warning("Could not notify admin %s: %s", admin, e)

@@ -77,3 +77,19 @@ async def test_resolve_token_only_returns_uploaded_episodes(ctx, db):
     assert kind == "episode" and doc["_id"] == "anilist:21:1"
     assert await resolve_token(ctx, "epBBBBBBBBBBBBBBBB") == (None, None)    # unrelated/guessed token
     assert await resolve_token(ctx, {"$ne": None}) == (None, None)           # injection attempt
+
+
+def test_synopsis_and_status_only_when_reliable(cfg):
+    from anime_soul.captions import DEFAULT_TEMPLATE, caption_values, render
+    from anime_soul.schedule.anilist import short_synopsis
+    ep = {"episode": 5, "storage": {"file_id": "F", "file_size": 10, "quality": "1080p"},
+          "candidate": {"quality": "720p"}}
+    with_syn = render(DEFAULT_TEMPLATE, caption_values({"title_romaji": "X", "synopsis": "A <b>bold</b> elf."}, ep, cfg))
+    assert "📝 A &lt;b&gt;bold&lt;/b&gt; elf." in with_syn                     # escaped, never raw HTML
+    assert "Quality: 1080p" in with_syn and "Released · available now" in with_syn   # verified quality wins
+    without = render(DEFAULT_TEMPLATE, caption_values({"title_romaji": "X"}, ep, cfg))
+    assert "📝" not in without
+    assert short_synopsis(None) is None and short_synopsis("<br>  ") is None
+    long = "First sentence here. " * 30 + "(Source: Crunchyroll)"
+    s = short_synopsis(long)
+    assert len(s) <= 221 and s.endswith(".") and "Source" not in s
