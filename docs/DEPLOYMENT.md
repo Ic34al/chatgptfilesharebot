@@ -111,6 +111,14 @@ Never scale `worker` above 1 — Telegram allows only one process to receive a b
 /pending                     → upcoming episodes in IST
 /captions                    → see placeholders, set per-anime templates
 ```
+**Automatic discovery (on by default).** Every monitor cycle the bot asks AniList for the currently
+airing TV/TV_SHORT/ONA anime (`AUTO_DISCOVER_MAX_PAGES` × 50, most popular first, default 200) and adds any
+it doesn't know yet (marked 🛰 in `/anime`). It never re-adds a show you removed with `/removeanime`
+and never overwrites settings of shows you added yourself. Season is guessed from the title
+("2nd Season" → 2, otherwise 1); fix it with `/setanime <id> season=N`. Discovery only gives schedules
+and episode numbers — **it does not give video files**. Delay alerts for discovered shows are grouped
+into one message instead of one per episode. Turn it off with `AUTO_DISCOVER_AIRING_ANIME=false`.
+
 Add an authorized source (one of). Until you do, aired episodes stay queued with
 **`SOURCE_NOT_CONFIGURED`** (shown in `/queue`, `/status` and an owner alert) — nothing is faked:
 - **Admin upload:** reply to the episode file you are licensed to share with `/attach <id> <episode> [quality]`.

@@ -55,6 +55,33 @@ query ($q: String, $n: Int) {
   }
 }""" % MEDIA_FIELDS
 
+# Currently airing TV/TV_SHORT/ONA anime, most popular first (used for automatic discovery).
+DISCOVER_QUERY = """
+query ($page: Int) {
+  Page(page: $page, perPage: 50) {
+    pageInfo { hasNextPage }
+    media(
+      type: ANIME
+      status: RELEASING
+      format_in: [TV, TV_SHORT, ONA]
+      sort: POPULARITY_DESC
+    ) {
+      id
+      idMal
+      format
+      status
+      season
+      seasonYear
+      episodes
+      synonyms
+      title { romaji english }
+      coverImage { extraLarge large }
+      nextAiringEpisode { episode airingAt }
+    }
+  }
+}
+"""
+
 
 class _RateLimiter:
     def __init__(self, per_minute: int):
@@ -189,6 +216,26 @@ class AniListProvider(ScheduleProvider):
             for m in ((data.get("data") or {}).get("Page") or {}).get("media") or []:
                 info = parse_media(m)
                 out[info.anime_id] = info
+        return out
+
+    async def discover_releasing(self, max_pages: int = 4) -> list:
+        """Discover currently releasing TV anime, ordered by popularity."""
+        out = []
+        for page in range(1, max(1, min(max_pages, 10)) + 1):
+            data = await self.query(
+                DISCOVER_QUERY,
+                {"page": page},
+            )
+            page_data = (
+                (data.get("data") or {}).get("Page") or {}
+            )
+            for media in page_data.get("media") or []:
+                info = parse_media(media)
+                if info.status == "RELEASING":
+                    out.append(info)
+            page_info = page_data.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
         return out
 
     async def search(self, query: str, limit: int = 5) -> List[AnimeInfo]:

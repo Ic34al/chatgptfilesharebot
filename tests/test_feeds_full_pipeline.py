@@ -104,6 +104,9 @@ class NoSlots:
     async def airing_window(self, ids, start, end):
         return []
 
+    async def discover_releasing(self, max_pages=4):
+        return []
+
     async def anime_info(self, ids):
         return {}
 

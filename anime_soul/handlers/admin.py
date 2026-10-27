@@ -37,8 +37,8 @@ ADMIN_COMMANDS = ["status", "queue", "anime", "addanime", "removeanime", "setani
 
 ADMIN_HELP = """<b>ANIME SOUL admin commands</b>
 /status – monitor, worker, FFmpeg &amp; source health
-/queue – queued / downloading / processing / uploading episodes
-/anime – tracked anime
+/queue – queued / processing episodes + next upcoming (IST)
+/anime [page] – tracked anime with next episode time (IST); 🛰 = auto-discovered
 /addanime &lt;AniList id or name&gt; [season=2 quality=1080p language=Hindi]
 /removeanime &lt;id&gt;
 /setanime &lt;id&gt; season=2 quality=720p language=… aliases=A;B cover=on|off
@@ -56,6 +56,18 @@ ADMIN_HELP = """<b>ANIME SOUL admin commands</b>
 /stats – stored share-link files
 /id – reply to a message forwarded from a channel to get its numeric ID
 /help – user help (+ this list for admins)"""
+
+
+def _join_limit(lines, limit: int = 4000) -> str:
+    """Join whole lines up to Telegram's limit (never cuts inside an HTML tag)."""
+    out, size = [], 0
+    for i, line in enumerate(lines):
+        if size + len(line) + 1 > limit - 40:
+            out.append(f"… and {len(lines) - i} more")
+            break
+        out.append(line)
+        size += len(line) + 1
+    return "\n".join(out)
 
 
 def _args(message) -> list[str]:
@@ -135,11 +147,11 @@ async def cmd_status(ctx, client, m):
 async def cmd_queue(ctx, client, m):
     active = (M.AIRING, M.AVAILABLE, M.DOWNLOADING, M.PROCESSING, M.UPLOADING, M.UPLOADED)
     rows = await ctx.db.list_by_states(active, 30)
-    if not rows:
-        await m.reply_text("Queue is empty. /pending shows failed jobs and upcoming episodes.")
-        return
-    titles = {a["_id"]: a.get("title_romaji") for a in await ctx.db.list_anime()}
-    out = ["<b>Queue</b> (use the code with /retry)"]
+    titles = {a["_id"]: a.get("title_romaji") for a in await ctx.db.list_anime(active_only=False)}
+    if rows:
+        out = ["<b>Queue</b> (use the code with /retry)"]
+    else:
+        out = ["Queue is empty. /pending shows failed jobs and upcoming episodes."]
     for d in rows:
         note = d.get("source_status") or ""
         if d.get("last_error"):
@@ -148,7 +160,14 @@ async def cmd_queue(ctx, client, m):
         out.append(f"• <code>{esc(d['_id'])}</code> {esc(titles.get(d.get('anime_id'), ''))} "
                    f"E{d.get('episode')} — {esc(M.STATE_LABELS.get(d['state'], d['state']))}{nxt}"
                    + (f"\n   ↳ {esc(redact(note))}" if note else ""))
-    await m.reply_text("\n".join(out)[:4000], parse_mode=HTML)
+    up = await ctx.db.list_upcoming(10)
+    if up:
+        out.append("\n<b>Upcoming (IST)</b>")
+        for d in up:
+            est = " (estimated)" if d.get("estimated") else ""
+            out.append(f"• {fmt_ist(d.get('airing_at'))} — {esc(titles.get(d.get('anime_id'), d.get('anime_id')))} "
+                       f"E{d.get('episode')}{est}")
+    await m.reply_text(_join_limit(out), parse_mode=HTML)
 
 
 async def cmd_anime(ctx, client, m):
@@ -156,11 +175,23 @@ async def cmd_anime(ctx, client, m):
     if not rows:
         await m.reply_text("No anime tracked yet. Use /addanime <AniList id or name>.")
         return
-    out = ["<b>Tracked anime</b>"]
-    for a in rows[:60]:
-        out.append(f"• <code>{a['_id']}</code> {esc(a.get('title_romaji'))} — S{a.get('season_number') or 1}, "
-                   f"{esc(a.get('quality') or ctx.cfg.default_quality)}, next ep {a.get('next_episode') or '?'}")
-    await m.reply_text("\n".join(out)[:4000], parse_mode=HTML)
+    args = _args(m)
+    per_page = 40
+    pages = (len(rows) + per_page - 1) // per_page
+    page = min(max(int(args[0]) if args and args[0].isdigit() else 1, 1), pages)
+    nxt = await ctx.db.next_airing_map()
+    auto = sum(1 for a in rows if a.get("auto_discovered"))
+    out = [f"<b>Tracked anime</b> — {len(rows)} ({auto} auto-discovered) · page {page}/{pages}"]
+    for a in rows[(page - 1) * per_page: page * per_page]:
+        ep = nxt.get(a["_id"])
+        when = (f"E{ep['episode']} {fmt_ist(ep['airing_at'])}" if ep
+                else f"next ep {a.get('next_episode') or '?'}")
+        mark = "🛰 " if a.get("auto_discovered") else ""
+        out.append(f"• {mark}<code>{a['_id']}</code> {esc(a.get('title_romaji'))} — S{a.get('season_number') or 1}, "
+                   f"{esc(a.get('quality') or ctx.cfg.default_quality)}, {esc(when)}")
+    if page < pages:
+        out.append(f"\nMore: /anime {page + 1}")
+    await m.reply_text(_join_limit(out), parse_mode=HTML)
 
 
 async def cmd_addanime(ctx, client, m):
@@ -245,7 +276,7 @@ async def cmd_pending(ctx, client, m):
         for d in up:
             est = " (estimated)" if d.get("estimated") else ""
             out.append(f"• <code>{d['_id']}</code> {fmt_ist(d.get('airing_at'))}{est}")
-    await m.reply_text("\n".join(out)[:4000], parse_mode=HTML)
+    await m.reply_text(_join_limit(out), parse_mode=HTML)
 
 
 async def cmd_retry(ctx, client, m):

@@ -5,6 +5,7 @@ did still works: `/start`, `/help`, send a file → get a share link, `/stats`.
 
 New features:
 - **Schedule tracking** from AniList (Jikan as fallback), times shown in **IST**, rescheduling and sequels handled.
+- **Automatic discovery** of currently airing TV/TV_SHORT/ONA anime from AniList (`AUTO_DISCOVER_AIRING_ANIME`, most popular first). Discovery only adds schedules — never video URLs.
 - **Release detection** from AniList and from authorized partner RSS/Atom/JSON feeds; duplicate-safe.
 - **Authorized sources only**: admin uploads (`/attach`), allow-listed partner RSS/Atom or JSON feeds, or a local licensed library. No scraping, no torrents, no DRM bypass. With no source configured, episodes wait as `SOURCE_NOT_CONFIGURED`.
 - **FFmpeg processing**: FFprobe validation (video/audio streams, duration, size), lossless MKV → MP4 remux when possible, optional transcode/downscale, disk and timeout limits.
@@ -40,7 +41,7 @@ anime_soul/
   fsub.py, delivery.py, deeplink.py, captions.py
   handlers/          user and admin commands
   runner.py          startup, roles, graceful shutdown
-tests/               136 tests (Telegram/feeds mocked; real FFmpeg; optional real MongoDB)
+tests/               148 tests (Telegram/feeds mocked; real FFmpeg; optional real MongoDB)
 ```
 
 ## Local run

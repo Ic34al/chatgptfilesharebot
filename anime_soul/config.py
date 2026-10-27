@@ -106,6 +106,8 @@ class Config:
     local_source_roots: Tuple[str, ...] = ()
     dry_run: bool = False
     auto_track_sequels: bool = True
+    auto_discover_airing_anime: bool = True
+    auto_discover_max_pages: int = 4        # 50 anime per page, most popular first (max 10)
     default_quality: str = "1080p"
     default_language: str = "Japanese (English Sub)"
     protect_content: bool = False
@@ -207,6 +209,11 @@ def load_config() -> Config:
         local_source_roots=tuple(v.strip() for v in os.getenv("LOCAL_SOURCE_ROOTS", "").split(",") if v.strip()),
         dry_run=_bool("DRY_RUN", True),   # safe default: nothing is uploaded/posted until DRY_RUN=false
         auto_track_sequels=_bool("AUTO_TRACK_SEQUELS", True),
+        auto_discover_airing_anime=_bool(
+            "AUTO_DISCOVER_AIRING_ANIME",
+            True,
+        ),
+        auto_discover_max_pages=min(10, max(1, _int("AUTO_DISCOVER_MAX_PAGES", 4))),
         default_quality=os.getenv("DEFAULT_QUALITY", "1080p"),
         default_language=os.getenv("DEFAULT_LANGUAGE", "Japanese (English Sub)"),
         protect_content=_bool("PROTECT_CONTENT", False),

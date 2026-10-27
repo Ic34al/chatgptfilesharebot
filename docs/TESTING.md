@@ -1,5 +1,26 @@
 # Testing report and live demonstration checklist
 
+## Update — automatic airing-anime discovery (27 Oct 2026)
+
+| Run | Result |
+|---|---|
+| `python -m pytest` (Python 3.11.17, mongomock, real ffmpeg) | **144 passed**, 4 skipped (real-MongoDB file) |
+| Same suite against real MongoDB 7.0.2 | **148 passed** |
+| `py_compile` + `pyflakes` on all modified files | clean |
+| Real AniList call `discover_releasing(2)` (public API, no key) | 100 anime, all `RELEASING`, formats TV/TV_SHORT/ONA; season guesses correct |
+
+New `tests/test_auto_discovery.py` (12, AniList mocked): query parsing and non-RELEASING skipped ·
+stops when `hasNextPage` is false · page limit (2, cap 10, min 1) · new anime saved with defaults and
+scheduled in the same cycle · tracked anime not duplicated or overwritten, removed anime stays removed ·
+AniList discovery failure doesn't stop schedule polling or the heartbeat · disabled by
+`AUTO_DISCOVER_AIRING_ANIME=false` · sequels still tracked · grouped delay alerts · discovered episode
+queued with `SOURCE_NOT_CONFIGURED` and **never downloaded, uploaded or posted** without an authorized
+source · `/anime` shows IST times, 🛰 marker and pages under 4000 chars; `/queue` shows upcoming (IST).
+
+Not verified: the Heroku deployment and your live bot (no Heroku access from this environment).
+
+---
+
 ## Automated tests — result (27 Oct 2026, branch `feature/anime-soul-full-pipeline`)
 
 Command: `pip install -r requirements-dev.txt && python -m pytest -v`

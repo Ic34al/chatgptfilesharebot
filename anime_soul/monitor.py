@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from datetime import timedelta
 from typing import Optional
 
@@ -17,6 +18,20 @@ from .tg import Notifier, esc
 from .timeutil import fmt_ist, utcnow
 
 log = logging.getLogger(__name__)
+
+_SEASON_RES = (re.compile(r"\bseason\s*(\d{1,2})\b", re.I),
+               re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\s+season\b", re.I),
+               re.compile(r"\bs(\d{1,2})\b", re.I))
+
+
+def guess_season(info) -> int:
+    """Season number from AniList titles ("… Season 2", "… 2nd Season", "… S2"); 1 if not stated."""
+    for title in (info.title_english, info.title_romaji, *(info.synonyms or [])):
+        for rx in _SEASON_RES:
+            m = rx.search(title or "")
+            if m and 1 <= int(m.group(1)) <= 30:
+                return int(m.group(1))
+    return 1
 
 
 class ReleaseMonitor:
@@ -32,9 +47,44 @@ class ReleaseMonitor:
 
     async def poll_once(self) -> dict:
         """One monitor cycle. Returns counters (useful for tests and /status)."""
-        stats = {"new": 0, "rescheduled": 0, "aired": 0, "delayed": 0, "sequels": 0, "errors": 0, "feed_new": 0}
+        stats = {"new": 0, "rescheduled": 0, "aired": 0, "delayed": 0, "sequels": 0, "errors": 0, "feed_new": 0,
+                 "auto_discovered": 0}
         anime = await self.db.list_anime(active_only=True)
         now = utcnow()
+        if getattr(self.cfg, "auto_discover_airing_anime", True):
+            # Automatic discovery: schedule data only. Video files still come exclusively from
+            # authorized sources (/sources, /attach); nothing here creates a download URL.
+            try:
+                discovered = await self.anilist.discover_releasing(getattr(self.cfg, "auto_discover_max_pages", 4))
+                added = 0
+                for info in discovered:
+                    existing = await self.db.get_anime(info.anime_id)
+                    if existing:
+                        continue          # already tracked, or removed with /removeanime (stays removed)
+                    data = info.to_doc()
+                    data.update({
+                        "next_episode": info.next_episode,
+                        "quality": self.cfg.default_quality,
+                        "language": self.cfg.default_language,
+                        "season_number": guess_season(info),
+                        "aliases": [],
+                        "auto_discovered": True,
+                    })
+                    await self.db.upsert_anime(info.anime_id, data)
+                    added += 1
+                stats["auto_discovered"] = added
+                if added:
+                    log.info(
+                        "Auto-discovered %s currently releasing anime",
+                        added,
+                    )
+                    anime = await self.db.list_anime(active_only=True)
+            except ScheduleError as exc:
+                stats["errors"] += 1
+                log.warning(
+                    "Automatic anime discovery failed: %s",
+                    exc,
+                )
         if anime:
             ids = [a["_id"] for a in anime]
             start = now - timedelta(hours=self.cfg.lookback_hours)
@@ -139,20 +189,38 @@ class ReleaseMonitor:
         threshold = now - timedelta(minutes=self.cfg.delay_alert_minutes)
         docs = await self.db.episodes.find({"state": M.AIRING, "airing_at": {"$lte": threshold},
                                             "delay_alerted": {"$ne": True}}).to_list(length=200)
+        quiet = 0
         for d in docs:
             anime = await self.db.get_anime(d["anime_id"]) or {}
-            await self.notifier.alert(
-                f"⏳ <b>{esc(anime.get('title_romaji', d['anime_id']))}</b> episode {d['episode']} aired at "
-                f"{fmt_ist(d['airing_at'])} but no authorized file has been found yet.\n"
-                f"Key: <code>{esc(d['_id'])}</code>. Attach one with /attach or check /sources.")
+            if anime.get("auto_discovered"):
+                quiet += 1        # one summary below instead of one DM per episode
+            else:
+                await self.notifier.alert(
+                    f"⏳ <b>{esc(anime.get('title_romaji', d['anime_id']))}</b> episode {d['episode']} aired at "
+                    f"{fmt_ist(d['airing_at'])} but no authorized file has been found yet.\n"
+                    f"Key: <code>{esc(d['_id'])}</code>. Attach one with /attach or check /sources.")
             await self.db.episodes.update_one({"_id": d["_id"]}, {"$set": {"delay_alerted": True}})
+        if quiet:
+            await self.notifier.alert(
+                f"⏳ {quiet} episode(s) of auto-discovered anime aired, but no authorized file has been found. "
+                "They stay queued (nothing is downloaded or posted). See /queue; add a source with /sources.",
+                key="delay-auto-discovered")
         # Give up after SOURCE_GIVEUP_HOURS with a final alert.
         giveup = now - timedelta(hours=self.cfg.source_giveup_hours)
         stale = await self.db.episodes.find({"state": M.AIRING, "airing_at": {"$lte": giveup}}).to_list(length=200)
+        quiet_ids = []
         for d in stale:
             await self.db.set_state(d["_id"], M.FAILED, last_error="No authorized source within give-up window")
+            if (await self.db.get_anime(d["anime_id"]) or {}).get("auto_discovered"):
+                quiet_ids.append(d["_id"])
+                continue
             await self.notifier.alert(f"❌ Gave up waiting for <code>{esc(d['_id'])}</code> "
                                       f"(no authorized file after {self.cfg.source_giveup_hours}h). Use /retry to resume.")
+        if quiet_ids:
+            await self.notifier.alert(
+                f"❌ Gave up on {len(quiet_ids)} auto-discovered episode(s) with no authorized file after "
+                f"{self.cfg.source_giveup_hours}h (e.g. <code>{esc(quiet_ids[0])}</code>). Use /retry to resume.",
+                key="giveup-auto-discovered")
         return len(docs)
 
     async def run(self, stop: asyncio.Event) -> None:

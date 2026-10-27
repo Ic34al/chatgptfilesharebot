@@ -232,6 +232,13 @@ class AnimeDB:
     async def list_by_states(self, states, limit: int = 30) -> List[dict]:
         return await self.episodes.find({"state": {"$in": list(states)}}).sort("airing_at", 1).to_list(length=limit)
 
+    async def next_airing_map(self) -> Dict[int, dict]:
+        """anime_id → its earliest scheduled (not yet aired) episode."""
+        out: Dict[int, dict] = {}
+        async for d in self.episodes.find({"state": M.SCHEDULED}).sort("airing_at", 1):
+            out.setdefault(d["anime_id"], d)
+        return out
+
     async def list_upcoming(self, limit: int = 20) -> List[dict]:
         return await self.episodes.find({"state": M.SCHEDULED}).sort("airing_at", 1).to_list(length=limit)
 

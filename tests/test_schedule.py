@@ -74,8 +74,15 @@ async def test_mark_aired_only_past_episodes(db):
 
 
 class FakeAniList:
-    def __init__(self, slots=None, infos=None, fail=False):
+    def __init__(self, slots=None, infos=None, fail=False, discovered=None, discover_fail=False):
         self.slots, self.infos, self.fail = slots or [], infos or {}, fail
+        self.discovered, self.discover_fail, self.discover_calls = discovered or [], discover_fail, []
+
+    async def discover_releasing(self, max_pages=4):
+        self.discover_calls.append(max_pages)
+        if self.discover_fail:
+            raise ScheduleError("AniList HTTP 503")
+        return list(self.discovered)
 
     async def airing_window(self, ids, start, end):
         if self.fail:
