@@ -8,7 +8,7 @@ from html.parser import HTMLParser
 from typing import Dict
 
 PLACEHOLDERS = ("anime_title", "season", "episode", "quality", "language", "release_date", "file_size",
-                "channel_name")
+                "channel_name", "status", "synopsis")
 CAPTION_LIMIT = 1024   # Telegram media caption limit (visible characters)
 MESSAGE_LIMIT = 4096   # text message limit
 
@@ -19,7 +19,9 @@ DEFAULT_TEMPLATE = (
     "🎧 Language: {language}\n"
     "💎 Quality: {quality}\n"
     "📦 Size: {file_size}\n"
-    "🗓 Released: {release_date}\n\n"
+    "🗓 Released: {release_date}\n"
+    "📡 Status: {status}\n\n"
+    "{synopsis}"
     "The new episode is available!\n\n"
     "👇 Tap <b>GET EPISODE</b> below to get the actual episode file.\n\n"
     "Join <b>{channel_name}</b> for upcoming releases and updates."
@@ -120,9 +122,14 @@ def caption_values(anime: dict, episode: dict, cfg, file_size=None) -> Dict[str,
         "anime_title": anime.get("title_english") or anime.get("title_romaji") or "Unknown",
         "season": anime.get("season_number") or 1,
         "episode": episode.get("episode"),
-        "quality": (episode.get("candidate") or {}).get("quality") or anime.get("quality") or cfg.default_quality,
+        # Prefer the quality FFprobe measured on the uploaded file; fall back to the source's label.
+        "quality": storage.get("quality") or (episode.get("media") or {}).get("quality")
+        or (episode.get("candidate") or {}).get("quality") or anime.get("quality") or cfg.default_quality,
         "language": (episode.get("candidate") or {}).get("language") or anime.get("language") or cfg.default_language,
         "release_date": fmt_ist(episode.get("airing_at")),
         "file_size": human_size(file_size or storage.get("file_size")),
         "channel_name": cfg.channel_name,
+        "status": "✅ Released · available now" if storage.get("file_id") else "Released",
+        # Synopsis only when AniList supplied one; rendered as its own paragraph, else nothing.
+        "synopsis": f"📝 {anime['synopsis']}\n\n" if anime.get("synopsis") else "",
     }

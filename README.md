@@ -5,12 +5,16 @@ did still works: `/start`, `/help`, send a file → get a share link, `/stats`.
 
 New features:
 - **Schedule tracking** from AniList (Jikan as fallback), times shown in **IST**, rescheduling and sequels handled.
-- **Authorized sources only**: admin uploads (`/attach`), allow-listed partner JSON feeds, or a local licensed library. No scraping, no DRM bypass.
-- **Validated uploads** to a private storage channel (size, container signature, checksum, optional ffprobe).
+- **Release detection** from AniList and from authorized partner RSS/Atom/JSON feeds; duplicate-safe.
+- **Authorized sources only**: admin uploads (`/attach`), allow-listed partner RSS/Atom or JSON feeds, or a local licensed library. No scraping, no torrents, no DRM bypass. With no source configured, episodes wait as `SOURCE_NOT_CONFIGURED`.
+- **FFmpeg processing**: FFprobe validation (video/audio streams, duration, size), lossless MKV → MP4 remux when possible, optional transcode/downscale, disk and timeout limits.
+- **Validated uploads** to a private storage channel (size, container signature, checksum, FFprobe).
 - **Channel posts** with thumbnail, HTML caption templates and a **GET EPISODE** button that opens the bot's delivery flow.
 - **Force-subscribe (FSUB)** on one or more channels, optional join-request mode, TRY AGAIN button.
-- **Admin controls**: `/status /anime /addanime /removeanime /setanime /pending /retry /pause /resume /broadcast /captions /sources /testupload /attach /setthumb /dryrun /stats /adminhelp`.
-- **Safe 24/7 operation**: MongoDB leases (no duplicate uploads or posts), bounded retries with back-off, delay alerts, FloodWait handling, restart recovery, graceful shutdown, dry-run mode.
+- **Admin controls**: `/status /queue /help /anime /addanime /removeanime /setanime /pending /retry /pause /resume /broadcast /captions /sources /testupload /attach /setthumb /dryrun /stats /adminhelp`.
+- **Safe 24/7 operation**: MongoDB leases (no duplicate uploads or posts), single-monitor lock, bounded retries with back-off, delay alerts, FloodWait handling, restart recovery, graceful shutdown, dry-run mode (default on) and `/testupload full`.
+
+Pipeline: `detected → queued → downloading → processing → uploading → published` (or `failed`, retry with `/retry`).
 
 ## Docs
 - [docs/AUDIT.md](docs/AUDIT.md) — what was in the repository and what was wrong
@@ -25,8 +29,9 @@ bot.py, database.py, helper_func.py   original modules (kept, compatible)
 anime_soul/
   config.py          settings from environment variables
   schedule/          AniList + Jikan clients
-  monitor.py         schedule loop, delay alerts, sequels
-  sources/           authorized source adapters (inbox, local dir, http feed)
+  monitor.py         schedule + feed release detection, delay alerts, sequels, leader lock
+  sources/           authorized source adapters (inbox, local dir, JSON feed, RSS/Atom feed)
+  processing.py      FFprobe validation, FFmpeg remux/transcode
   netsafe.py         download allow-list, SSRF protection
   validate.py        file checks
   uploader.py        storage-channel upload
@@ -35,7 +40,7 @@ anime_soul/
   fsub.py, delivery.py, deeplink.py, captions.py
   handlers/          user and admin commands
   runner.py          startup, roles, graceful shutdown
-tests/               93 tests with mocked Telegram/APIs
+tests/               136 tests (Telegram/feeds mocked; real FFmpeg; optional real MongoDB)
 ```
 
 ## Local run
@@ -50,7 +55,8 @@ python main.py
 
 ## Heroku
 `Procfile`: `worker: python main.py` (scale to 1) and an optional `uploader` process for split mode.
-Python version is set by `.python-version` (3.11). See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+Python version is set by `.python-version` (3.11). FFmpeg comes from the
+`heroku-buildpack-activestorage-preview` buildpack listed in `app.json`. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 Secrets live only in environment variables / Heroku Config Vars. Never commit them.
 

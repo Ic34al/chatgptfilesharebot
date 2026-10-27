@@ -35,7 +35,18 @@ def cfg(tmp_path):
 
 @pytest_asyncio.fixture
 async def mongo():
-    return AsyncMongoMockClient(tz_aware=True)
+    """mongomock by default. With REAL_MONGODB_URI set, every test runs against that real
+    (disposable!) server instead; the 'test' database is dropped before and after each test."""
+    uri = os.getenv("REAL_MONGODB_URI")
+    if not uri:
+        yield AsyncMongoMockClient(tz_aware=True)
+        return
+    from motor.motor_asyncio import AsyncIOMotorClient
+    client = AsyncIOMotorClient(uri, tz_aware=True, serverSelectionTimeoutMS=5000)
+    await client.drop_database("test")
+    yield client
+    await client.drop_database("test")
+    client.close()
 
 
 @pytest_asyncio.fixture
@@ -88,6 +99,18 @@ class FakeClient:
 
     async def get_me(self):
         return self.me
+
+    async def download_media(self, ref, file_name=None, **kw):
+        """Simulates downloading a Telegram file: copies self.downloads[ref] to file_name."""
+        import shutil as _sh
+        self.calls.append(("download_media", ref, file_name, kw))
+        self._maybe_fail("download_media")
+        src = getattr(self, "downloads", {}).get(ref)
+        if not src:
+            return None
+        os.makedirs(os.path.dirname(file_name), exist_ok=True)
+        _sh.copy(src, file_name)
+        return file_name
 
     async def send_cached_media(self, chat_id, file_id, **kw):
         self.calls.append(("send_cached_media", chat_id, file_id, kw))
@@ -191,6 +214,30 @@ def sample_video(tmp_path_factory):
                     "-f", "lavfi", "-i", "sine=frequency=440:duration=40", "-c:v", "libx264", "-preset", "ultrafast",
                     "-c:a", "aac", "-shortest", str(out)], check=True)
     return out
+
+
+def make_media(path, *, duration=40, size="160x90", audio=True, subs=False, vcodec="libx264", fmt=None):
+    """Generate a small synthetic test-pattern file with ffmpeg (no copyrighted content)."""
+    import subprocess
+    cmd = ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", f"testsrc=size={size}:rate=10:duration={duration}"]
+    if audio:
+        cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}"]
+    if subs:
+        srt = str(path) + ".srt"
+        with open(srt, "w") as fh:
+            fh.write("1\n00:00:01,000 --> 00:00:03,000\nHello\n")
+        cmd += ["-i", srt]
+    cmd += ["-map", "0:v"]
+    if audio:
+        cmd += ["-map", "1:a", "-c:a", "aac"]
+    if subs:
+        cmd += ["-map", f"{2 if audio else 1}:s", "-c:s", "ass"]
+    cmd += ["-c:v", vcodec, "-preset", "ultrafast"] if vcodec == "libx264" else ["-c:v", vcodec]
+    if fmt:
+        cmd += ["-f", fmt]
+    cmd.append(str(path))
+    subprocess.run(cmd, check=True)
+    return path
 
 
 @pytest.fixture

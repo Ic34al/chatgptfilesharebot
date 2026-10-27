@@ -14,6 +14,15 @@ address bar) on Heroku and MongoDB pages if a button is hidden.
    - Your public **ANIME SOUL** channel — announcements go here (you may already have it).
 4. Add the bot as **administrator** in both channels with *Post messages* (and *Edit/Delete messages*) permissions.
 5. For every **FSUB** channel, add the bot as administrator too (needed to check membership and create invite links). For join-request mode it also needs *Invite users via link*.
+   **Permissions the bot needs**
+
+   | Channel | Bot role | Permissions |
+   |---|---|---|
+   | Storage (private) | Admin | Post messages (uploads), Edit messages |
+   | ANIME SOUL post channel | Admin | Post messages, Edit messages (to fix a post) |
+   | Test channel (optional, private) | Admin | Post messages |
+   | Each FSUB channel | Admin | None required to read members; **Invite users via link** for invite buttons and join-request mode |
+
 6. IDs: after deploying (step 4), open the bot and send `/id` → that's your `OWNER_ID`. Forward any post from each channel to the bot and **reply** to it with `/id` → you get the `-100…` channel ID. (Before deploy you can also use any "user info" bot.)
 
 ## 2. MongoDB Atlas (free tier)
@@ -29,9 +38,9 @@ address bar) on Heroku and MongoDB pages if a button is hidden.
 
 ## 3. GitHub (Safari or GitHub app)
 
-The code is on branch **`feature/anime-soul-automation`**. You can either:
-- deploy that branch directly (step 4.3), or
-- merge it: GitHub app → repository → *Pull requests* → *New* → base `main` ← compare `feature/anime-soul-automation` → *Create* → review → *Merge*.
+The new code is on branch **`feature/anime-soul-full-pipeline`** (pull request into `main`). You can either:
+- deploy that branch directly (Heroku step 4), or
+- merge it: GitHub app → repository → *Pull requests* → open the PR → review → *Merge*.
 
 ## 4. Heroku
 
@@ -52,12 +61,20 @@ The code is on branch **`feature/anime-soul-automation`**. You can either:
    | `DRY_RUN` | `true` for the first day |
 
    Optional ones are listed with defaults in `.env.example` (copy only the value, not the `# comment`).
-3. **Deploy** tab → *Deployment method* **GitHub** → connect → search `chatgptfilesharebot` → *Connect*.
-   *Manual deploy* → choose branch `feature/anime-soul-automation` (or `main` after merging) → **Deploy Branch**. Wait for "Your app was successfully deployed".
-4. **Resources** tab → click the pencil on `worker: python main.py` → switch **on** → Confirm.
+   Useful extras: `TEST_CHANNEL_ID` (private channel for test posts), `ALLOWED_SOURCE_HOSTS`
+   (host of your licensed feed), `PROCESS_MODE=auto`, `DRY_RUN_PROCESS=true` for the first test.
+   Don't change existing values you already use in production unless you mean to.
+3. **FFmpeg buildpack** — *Settings → Buildpacks → Add buildpack* → paste
+   `https://github.com/heroku/heroku-buildpack-activestorage-preview` → Save. Then tap *⋮* next to it and
+   move it **above** `heroku/python` (if your app already has a different FFmpeg buildpack, remove it).
+   It installs `ffmpeg` and `ffprobe` (FFmpeg 7.1 on heroku-24). Without it `/status` shows
+   `FFmpeg: MISSING` and, with `FFMPEG_REQUIRED=true`, nothing is uploaded.
+4. **Deploy** tab → *Deployment method* **GitHub** → connect → search `chatgptfilesharebot` → *Connect*.
+   *Manual deploy* → choose branch `feature/anime-soul-full-pipeline` (or `main` after merging) → **Deploy Branch**. Wait for "Your app was successfully deployed".
+5. **Resources** tab → click the pencil on `worker: python main.py` → switch **on** → Confirm.
    Leave `uploader` **off** (only used in split mode, below). There is no web dyno; that's expected.
-5. Logs: *More → View logs*. You should see `Started as @YourBot (role=all, dry_run=True)`.
-6. Optional — *Automatic deploys* from the branch so every push redeploys.
+6. Logs: *More → View logs*. You should see `Started as @YourBot (role=all, dry_run=True)`.
+7. Optional — *Automatic deploys* from the branch so every push redeploys.
 
 ### Process types
 | Process | Command | When |
@@ -66,13 +83,23 @@ The code is on branch **`feature/anime-soul-automation`**. You can either:
 | `uploader` | `python main.py --role pipeline` | Only for split mode |
 
 **Split mode** (keeps the bot snappy during heavy uploads): set `ROLE=bot`, then scale `uploader` to 1.
-Both dynos use the same bot token; only the `bot` dyno receives updates. MongoDB leases make it
-safe even if both accidentally run the pipeline.
+Both dynos use the same bot token; only the `bot` dyno receives updates. If both dynos accidentally
+run the pipeline (e.g. `ROLE=all` **and** `uploader=1`): MongoDB job leases stop duplicate uploads/posts,
+and a MongoDB **monitor lock** lets only one release monitor run (the other logs
+"Another release monitor is active" and stays idle). `/status` shows who holds the lock.
+Never scale `worker` above 1 — Telegram allows only one process to receive a bot's updates.
 
 ### Resource needs
-- One **Basic** dyno (512 MB RAM) is enough for `MAX_CONCURRENT_JOBS=1`. Files stream to disk, not RAM.
-- Dyno disk is **ephemeral** and wiped on every restart (at least daily). The bot only keeps a file there between download and upload; if a restart happens mid-way it re-downloads automatically. Permanent storage is the Telegram storage channel + MongoDB.
-- Optional ffprobe for deeper video checks: *Settings → Add buildpack* → `https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git` (above `heroku/python`), then redeploy. Without it, size, container signature and checksum checks still run.
+- One **Basic** dyno (0.5 GB RAM) is enough for `MAX_CONCURRENT_JOBS=1` with `PROCESS_MODE=auto`:
+  `auto` never re-encodes — it only remuxes (stream copy, low CPU/RAM) H.264/AAC MKVs without
+  subtitles into streamable MP4, and leaves everything else as-is. Files stream to disk, not RAM.
+- **Transcoding** (`PROCESS_MODE=transcode` or `MAX_OUTPUT_HEIGHT`) is CPU-heavy. On a 1x-CPU Basic dyno a
+  24-minute 1080p episode can take longer than real time and may hit `FFMPEG_TIMEOUT_SECONDS`; use
+  Standard-2X or a VPS for that, keep `FFMPEG_THREADS=2`, and `MAX_CONCURRENT_JOBS=1`.
+- Dyno disk is **ephemeral** and wiped on every restart (at least daily). Heroku doesn't publish a fixed
+  disk size, so the bot checks free space before every download/encode (`DISK_HEADROOM_MB`). The source
+  file is kept until the Telegram upload is confirmed; then temp files are deleted. If a restart happens
+  mid-way it re-downloads automatically. Permanent storage is the Telegram storage channel + MongoDB.
 
 ## 5. First run (in Telegram, as the owner)
 ```
@@ -84,14 +111,23 @@ safe even if both accidentally run the pipeline.
 /pending                     → upcoming episodes in IST
 /captions                    → see placeholders, set per-anime templates
 ```
-Add an authorized source (one of):
+Add an authorized source (one of). Until you do, aired episodes stay queued with
+**`SOURCE_NOT_CONFIGURED`** (shown in `/queue`, `/status` and an owner alert) — nothing is faked:
 - **Admin upload:** reply to the episode file you are licensed to share with `/attach <id> <episode> [quality]`.
-- **Partner feed:** set `ALLOWED_SOURCE_HOSTS=cdn.partner.com`, then
+- **Partner RSS/Atom feed** (each item needs a direct-download `<enclosure>`; torrents/magnets are ignored):
+  set `ALLOWED_SOURCE_HOSTS=cdn.partner.com`, then
+  `/sources add_rss partner https://cdn.partner.com/anime-soul.rss | Licence agreement #123 with Partner`
+- **Partner JSON feed:** set `ALLOWED_SOURCE_HOSTS=cdn.partner.com`, then
   `/sources add_feed partner https://cdn.partner.com/anime-soul.json | Licence agreement #123 with Partner`
 - **Server directory (VPS only):** set `LOCAL_SOURCE_ROOTS=/srv/library`, then
   `/sources add_dir library /srv/library/ongoing | Our own licensed library`
 
-When dry-run reports look right: `/dryrun off` (or set `DRY_RUN=false`).
+Test the whole path safely first:
+1. `DRY_RUN=true` + `DRY_RUN_PROCESS=true` → when an episode is found the bot downloads it, runs
+   FFprobe/FFmpeg and sends you a report. Nothing is uploaded or posted.
+2. Reply to a short video **you own** with `/testupload full` → download → FFmpeg → storage upload → test link.
+3. `/testupload full publish` → TEST post in `TEST_CHANNEL_ID` (add `live` to use the main channel).
+4. When the reports look right: `/dryrun off` (or set `DRY_RUN=false`).
 
 ---
 
@@ -105,6 +141,11 @@ When dry-run reports look right: `/dryrun off` (or set `DRY_RUN=false`).
 | Users always see "join the channel" | Bot isn't admin in the FSUB channel (membership can't be read → fails closed). `/status` + admin alerts show this. |
 | "Invalid or expired file link" for old links | Old base64 tokens longer than 64 characters never reached the bot; resend the file to get a new short link. |
 | No episodes appear | `/anime` empty? `/addanime`. AniList down? `/status` shows the last schedule error; the Jikan fallback creates *estimated* times. |
+| `/queue` shows `SOURCE_NOT_CONFIGURED` | No authorized source is enabled. Add one with `/sources add_rss …` / `/attach`. |
+| `FFMPEG_NOT_AVAILABLE` alert | Add the activestorage-preview buildpack (Heroku step 3) and redeploy. |
+| `Not enough disk space` | Lower `MAX_CONCURRENT_JOBS`, or the file is too big for the dyno; it retries later. |
+| `No audio stream` / `Duration too short` | The source file isn't a complete episode; it is rejected and not uploaded. |
+| `ffmpeg … timed out` | Transcoding is too slow for the dyno: use `PROCESS_MODE=auto`, a bigger dyno, or raise `FFMPEG_TIMEOUT_SECONDS`. |
 | Episode stuck in `airing` | No authorized file yet. You'll get a delay alert after `DELAY_ALERT_MINUTES`. `/attach` a file or check `/sources check`. |
 | `failed` with "could not be confirmed" | A network error happened while posting. Check the channel. If the post is **not** there: `/retry <key> publish`. If it is there, leave it. |
 | `Rejected file … SHA-256 / container / too small` | The source gave a bad or incomplete file. It is not uploaded; the bot waits for a valid one. |

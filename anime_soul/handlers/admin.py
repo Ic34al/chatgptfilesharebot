@@ -2,14 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
 import shlex
+import shutil
 
 from pyrogram import Client, enums, filters
 from pyrogram.errors import FloodWait, InputUserDeactivated, PeerIdInvalid, RPCError, UserIsBlocked
 from pyrogram.handlers import MessageHandler
 
 from .. import models as M
+from .. import processing
+from ..logging_setup import redact
+from ..sources.base import SourceItem
+from ..uploader import upload_episode
 from ..captions import DEFAULT_TEMPLATE, PLACEHOLDERS, TemplateError, caption_values, render, validate_template
 from ..deeplink import build_link
 from ..netsafe import UnsafeURL
@@ -23,27 +30,32 @@ from .user import bind
 log = logging.getLogger(__name__)
 HTML = enums.ParseMode.HTML
 
-ADMIN_COMMANDS = ["status", "anime", "addanime", "removeanime", "setanime", "pending", "retry", "pause", "resume",
+ADMIN_COMMANDS = ["status", "queue", "anime", "addanime", "removeanime", "setanime", "pending", "retry", "pause",
+                  "resume",
                   "broadcast", "captions", "sources", "testupload", "attach", "setthumb", "dryrun", "stats",
                   "adminhelp"]
 
 ADMIN_HELP = """<b>ANIME SOUL admin commands</b>
-/status – monitor &amp; worker health
+/status – monitor, worker, FFmpeg &amp; source health
+/queue – queued / downloading / processing / uploading episodes
 /anime – tracked anime
 /addanime &lt;AniList id or name&gt; [season=2 quality=1080p language=Hindi]
 /removeanime &lt;id&gt;
 /setanime &lt;id&gt; season=2 quality=720p language=… aliases=A;B cover=on|off
 /pending – pending/failed jobs and upcoming episodes
-/retry &lt;anilist:ID:EP | ID EP&gt; [publish]
+/retry &lt;anilist:ID:EP | ID EP&gt; [publish]  (IDs are shown by /queue, e.g. anilist:154587:5)
 /pause · /resume · /dryrun on|off
 /attach &lt;id&gt; &lt;episode&gt; [quality] – reply to an authorized video/file
 /setthumb &lt;id&gt; – reply to a photo (or: /setthumb &lt;id&gt; none)
 /captions – list · show/set/preview/reset &lt;id|default&gt;
-/sources – list · add_feed · add_dir · enable · disable · remove · check
-/testupload [publish] – reply to an authorized sample file
+/sources – list · add_rss · add_feed · add_dir · enable · disable · remove · check
+/testupload [full] [publish [live]] – reply to a sample video you own
+   full = download → FFmpeg check → upload (tests the real pipeline path)
+   publish = TEST post to TEST_CHANNEL_ID (add "live" to post in the main channel)
 /broadcast – reply to a message
 /stats – stored share-link files
-/id – reply to a message forwarded from a channel to get its numeric ID"""
+/id – reply to a message forwarded from a channel to get its numeric ID
+/help – user help (+ this list for admins)"""
 
 
 def _args(message) -> list[str]:
@@ -107,9 +119,36 @@ async def cmd_status(ctx, client, m):
         f"Storage channel: {'set' if ctx.cfg.storage_channel_id else 'MISSING'} · "
         f"Post channel: {'set' if ctx.cfg.post_channel_id else 'MISSING'} · FSUB channels: {len(ctx.cfg.fsub_channels)}",
     ]
+    tools = processing.tools_available()
+    lines.append(f"FFmpeg: {'ok' if tools['ffmpeg'] else 'MISSING'} · FFprobe: {'ok' if tools['ffprobe'] else 'MISSING'}"
+                 f" · Process mode: <code>{ctx.cfg.process_mode}</code>")
+    if ctx.sources is not None:
+        n = await ctx.sources.configured_count()
+        lines.append(f"Authorized sources enabled: {n}" + (f" — <b>{M.SOURCE_NOT_CONFIGURED}</b>" if n == 0 else ""))
+    holder = await ctx.db.lock_holder("monitor")
+    lines.append(f"Monitor lock: {esc(holder) if holder else 'free'}")
     if err:
-        lines.append(f"Last schedule error ({_age(err.get('at'))}): {esc(err.get('error'))}")
+        lines.append(f"Last schedule error ({_age(err.get('at'))}): {esc(redact(str(err.get('error'))))}")
     await m.reply_text("\n".join(lines), parse_mode=HTML)
+
+
+async def cmd_queue(ctx, client, m):
+    active = (M.AIRING, M.AVAILABLE, M.DOWNLOADING, M.PROCESSING, M.UPLOADING, M.UPLOADED)
+    rows = await ctx.db.list_by_states(active, 30)
+    if not rows:
+        await m.reply_text("Queue is empty. /pending shows failed jobs and upcoming episodes.")
+        return
+    titles = {a["_id"]: a.get("title_romaji") for a in await ctx.db.list_anime()}
+    out = ["<b>Queue</b> (use the code with /retry)"]
+    for d in rows:
+        note = d.get("source_status") or ""
+        if d.get("last_error"):
+            note = (d.get("last_error") or "")[:90]
+        nxt = f" · next {fmt_ist(d['next_attempt_at'])}" if d.get("next_attempt_at") else ""
+        out.append(f"• <code>{esc(d['_id'])}</code> {esc(titles.get(d.get('anime_id'), ''))} "
+                   f"E{d.get('episode')} — {esc(M.STATE_LABELS.get(d['state'], d['state']))}{nxt}"
+                   + (f"\n   ↳ {esc(redact(note))}" if note else ""))
+    await m.reply_text("\n".join(out)[:4000], parse_mode=HTML)
 
 
 async def cmd_anime(ctx, client, m):
@@ -374,19 +413,20 @@ async def cmd_sources(ctx, client, m):
             health = "ok" if s.get("last_ok") else (esc(s.get("last_error")) or "unchecked")
             out.append(f"• <b>{esc(s['_id'])}</b> ({s.get('type')}, {state}) — {health} · licence: "
                        f"{esc((s.get('license_note') or '')[:60])}")
-        out.append("\nAdd: /sources add_feed &lt;name&gt; &lt;https url&gt; | &lt;licence/permission note&gt;"
+        out.append("\nAdd: /sources add_rss &lt;name&gt; &lt;https RSS/Atom url&gt; | &lt;licence/permission note&gt;"
+                   "\n/sources add_feed &lt;name&gt; &lt;https JSON url&gt; | &lt;licence/permission note&gt;"
                    "\n/sources add_dir &lt;name&gt; &lt;path&gt; | &lt;licence note&gt;"
                    "\n/sources enable|disable|remove &lt;name&gt; · /sources check")
         await m.reply_text("\n".join(out)[:4000], parse_mode=HTML)
         return
-    if sub in ("add_feed", "add_dir"):
+    if sub in ("add_feed", "add_rss", "add_dir"):
         if len(a) < 3 or not note:
             await m.reply_text("You must include a licence/permission note after '|' confirming you are "
                                "authorized to download and redistribute files from this source.")
             return
         name, target = a[1], a[2].split("|")[0].strip()
-        doc = {"_id": name, "type": "http_feed" if sub == "add_feed" else "local_dir",
-               "config": {"url": target} if sub == "add_feed" else {"path": target},
+        doc = {"_id": name, "type": {"add_feed": "http_feed", "add_rss": "rss_feed"}.get(sub, "local_dir"),
+               "config": {"path": target} if sub == "add_dir" else {"url": target},
                "authorized": True, "license_note": note[:500], "enabled": True, "added_by": m.from_user.id}
         if len(a) > 3 and a[3].startswith("auth_env="):
             doc["config"]["auth_header_env"] = a[3].split("=", 1)[1]
@@ -413,39 +453,94 @@ async def cmd_sources(ctx, client, m):
 
 
 async def cmd_testupload(ctx, client, m):
-    """Upload an authorized sample to storage, create a deep link and (optionally) a test post."""
+    """Upload a sample you own to storage, create a deep link and (only if asked) a TEST post.
+
+    /testupload            copy the replied file to storage (fast)
+    /testupload full       download → FFprobe/FFmpeg → upload, i.e. the real pipeline path
+    ... publish            TEST post to TEST_CHANNEL_ID; "publish live" posts to POST_CHANNEL_ID
+    """
+    args = [a.lower() for a in _args(m)]
     src, media_type, media = _replied_media(m)
     if not media:
-        await m.reply_text("Reply to an authorized sample video/file with /testupload [publish]")
+        await m.reply_text("Reply to a sample video you own (or may redistribute) with /testupload [full] [publish]")
         return
     if not ctx.cfg.storage_channel_id:
         await m.reply_text("STORAGE_CHANNEL_ID is not set.")
         return
-    try:
-        stored = await call_with_flood(client.copy_message, ctx.cfg.storage_channel_id, src.chat.id, src.id,
-                                       caption="#testupload")
-    except RPCError as e:
-        await m.reply_text(f"❌ Upload to storage channel failed: {e}\nIs the bot an admin there?")
-        return
-    smedia = stored.video or stored.document or stored.animation
     token = M.new_file_token()
-    await ctx.filedb.save_file(token, smedia.file_id, smedia.file_unique_id, False, fsub=True, test=True,
-                               storage_chat_id=stored.chat.id, storage_message_id=stored.id)
+    if "full" in args:
+        stored = await _testupload_full(ctx, client, m, src, media, token)
+        if not stored:
+            return
+        file_id, unique_id, chat_id, msg_id, size = (stored["file_id"], stored.get("file_unique_id"),
+                                                     stored["chat_id"], stored["message_id"], stored.get("file_size"))
+    else:
+        try:
+            msg = await call_with_flood(client.copy_message, ctx.cfg.storage_channel_id, src.chat.id, src.id,
+                                        caption="#testupload")
+        except RPCError as e:
+            await m.reply_text(f"❌ Upload to storage channel failed: {e}\nIs the bot an admin there?")
+            return
+        smedia = msg.video or msg.document or msg.animation
+        file_id, unique_id, chat_id, msg_id, size = (smedia.file_id, smedia.file_unique_id, msg.chat.id, msg.id,
+                                                     smedia.file_size)
+    await ctx.filedb.save_file(token, file_id, unique_id, False, fsub=True, test=True,
+                               storage_chat_id=chat_id, storage_message_id=msg_id)
     me = client.me or await client.get_me()
     link = build_link(me.username, token)
-    text = render(DEFAULT_TEMPLATE, _sample_values(ctx, None))
-    await m.reply_text(f"✅ Stored in storage channel (message {stored.id}, {smedia.file_size} bytes).\n"
+    await m.reply_text(f"✅ Stored in storage channel (message {msg_id}, {size} bytes).\n"
                        f"Test link (FSUB enforced): {link}", disable_web_page_preview=True)
-    if "publish" in _args(m):
-        if not ctx.cfg.post_channel_id:
-            await m.reply_text("POST_CHANNEL_ID is not set.")
+    if "publish" not in args:
+        return
+    target = ctx.cfg.test_channel_id
+    if target is None:
+        if "live" not in args:
+            await m.reply_text("Not posted. Set TEST_CHANNEL_ID for test posts, or use "
+                               "/testupload publish live to post in the main ANIME SOUL channel.")
             return
-        try:
-            await call_with_flood(client.send_message, ctx.cfg.post_channel_id, "🧪 TEST POST\n\n" + text,
-                                  parse_mode=HTML, reply_markup=episode_keyboard(link))
-            await m.reply_text("📣 Test post published to the post channel.")
-        except RPCError as e:
-            await m.reply_text(f"❌ Posting failed: {e}")
+        target = ctx.cfg.post_channel_id
+    if target is None:
+        await m.reply_text("POST_CHANNEL_ID is not set.")
+        return
+    text = render(DEFAULT_TEMPLATE, _sample_values(ctx, None))
+    try:
+        await call_with_flood(client.send_message, target, "🧪 TEST POST\n\n" + text,
+                              parse_mode=HTML, reply_markup=episode_keyboard(link))
+        where = "test channel" if target == ctx.cfg.test_channel_id else "main post channel"
+        await m.reply_text(f"📣 Test post published to the {where}.")
+    except RPCError as e:
+        await m.reply_text(f"❌ Posting failed: {e}")
+
+
+async def _testupload_full(ctx, client, m, src, media, token):
+    work = os.path.join(ctx.cfg.download_dir, f"testupload_{token}")
+    status = await m.reply_text("⬇️ Downloading sample from Telegram…")
+    try:
+        processing.ensure_disk(work, int(getattr(media, "file_size", 0) or 0) * 2, ctx.cfg.disk_headroom_mb)
+        name = getattr(media, "file_name", None) or f"sample_{token}.mp4"
+        path = await src.download(file_name=os.path.join(work, "src_" + os.path.basename(name)))
+        await status.edit_text("🎞 Validating with FFprobe / FFmpeg…")
+        result = await processing.process(path, work, ctx.cfg, base_name="testupload")
+        i = result.info
+        await status.edit_text(f"⬆️ Uploading ({result.action}; {i.video_codec} {i.width}x{i.height}, "
+                               f"{i.duration:.0f}s)…")
+        item = SourceItem("testupload", "local", path, os.path.basename(name), size=os.path.getsize(result.path),
+                          quality=i.quality, owned=True)
+        stored = await upload_episode(client, ctx.cfg.storage_channel_id, f"test:{token}",
+                                      {"_id": 0, "title_romaji": "TEST UPLOAD"}, 0, item, result.path,
+                                      timeout_s=ctx.cfg.upload_timeout_seconds, container=result.container,
+                                      media=i.to_doc())
+        await status.edit_text(f"✅ Full pipeline test passed: {result.action}, {i.quality or '?'}, "
+                               f"{i.duration:.0f}s.")
+        return stored
+    except Exception as e:
+        await status.edit_text(f"❌ Full test failed: {type(e).__name__}: {redact(str(e))[:300]}")
+        return None
+    finally:
+        real = os.path.realpath(work)
+        if real.startswith(os.path.realpath(ctx.cfg.download_dir) + os.sep):
+            with contextlib.suppress(Exception):
+                shutil.rmtree(real)
 
 
 async def cmd_broadcast(ctx, client, m):
@@ -505,7 +600,7 @@ def guard(fn):
             await fn(ctx, client, m)
         except Exception as e:
             log.exception("Admin command failed")
-            await m.reply_text(f"⚠️ Command failed: {type(e).__name__}: {str(e)[:300]}")
+            await m.reply_text(f"⚠️ Command failed: {type(e).__name__}: {redact(str(e))[:300]}")
     _wrapped.__name__ = fn.__name__
     return _wrapped
 

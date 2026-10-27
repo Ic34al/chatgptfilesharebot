@@ -117,7 +117,11 @@ async def test_waiting_for_source_backs_off(cfg, db, client, ctx):
     assert await claim_and_process(p, db, cfg) == M.AIRING
     ep = await db.get_episode("anilist:21:5")
     assert ep["source_checks"] == 1 and ep["next_attempt_at"] > utcnow() and ep["lease_owner"] is None
-    assert client.calls == []                                    # nothing uploaded/posted, no fake link
+    # Nothing uploaded/posted, no fake link; only an admin alert explaining why.
+    assert all(c[1] not in (STORAGE, POST) for c in client.calls)
+    assert ep["source_status"] == M.SOURCE_NOT_CONFIGURED and M.SOURCE_NOT_CONFIGURED in ep["last_error"]
+    alerts = [c for c in client.sent("send_message") if M.SOURCE_NOT_CONFIGURED in c[2]]
+    assert len(alerts) == 1 and alerts[0][1] == 1001
 
 
 @pytest.mark.asyncio
@@ -132,9 +136,15 @@ async def test_local_source_upload_validates_and_keeps_library_file(cfg, db, cli
     await setup_episode(db, attach=False)
     p = make_pipeline(cfg, db, client, ctx)
     assert await claim_and_process(p, db, cfg) == M.PUBLISHED
-    doc_up = client.sent("send_document")[0]
-    assert doc_up[1] == STORAGE and doc_up[3]["file_name"] == f.name
+    # H.264/AAC MKV without subtitles is remuxed (no re-encode) to a streamable MP4.
+    vid_up = client.sent("send_video")[0]
+    assert vid_up[1] == STORAGE and vid_up[3]["file_name"] == "Frieren - S02E05 [1080p].mp4"
+    assert vid_up[3]["supports_streaming"] and vid_up[3]["duration"] == 40
+    ep = await db.get_episode("anilist:21:5")
+    assert ep["processing"]["action"] == "remux" and ep["media"]["audio_codecs"] == ["aac"]
+    assert ep["storage"]["message_id"] and ep["storage"]["chat_id"] == STORAGE
     assert f.exists()                                            # never delete files we don't own
+    assert not os.path.exists(vid_up[2])                         # temp remux removed after upload
 
 
 @pytest.mark.asyncio

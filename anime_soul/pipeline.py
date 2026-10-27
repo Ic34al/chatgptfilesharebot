@@ -17,6 +17,8 @@ from . import models as M
 from .captions import DEFAULT_TEMPLATE, TemplateError, caption_values, render
 from .config import Config
 from .db import AnimeDB
+from . import processing
+from .captions import human_size
 from .netsafe import DownloadError, UnsafeURL, download, make_session
 from .publisher import AmbiguousPublish, publish
 from .sources import SourceItem, SourceRegistry
@@ -78,76 +80,91 @@ class Pipeline:
     async def _advance(self, doc: dict, anime: dict) -> str:
         key = doc["_id"]
         state = doc["state"]
-        local_path = doc.get("local_path")
         try:
             # 1) find an authorized file
             if state == M.AIRING:
-                item = await self.sources.find(anime, doc["episode"])
+                item, reason = await self.sources.find_with_reason(anime, doc["episode"])
                 if not item:
-                    checks = doc.get("source_checks", 0) + 1
-                    wait = min(self.cfg.source_check_interval_seconds * (1 + checks // 6), 1800)
-                    await self.db.release(key, source_checks=checks,
-                                          next_attempt_at=utcnow() + timedelta(seconds=wait))
-                    return M.AIRING
+                    return await self._no_source(doc, anime, reason)
                 if await self.dry_run():
-                    await self._dry_run_report(doc, anime, item)
-                    await self.db.set_state(key, M.DRY_RUN_OK, candidate=item.to_doc())
-                    await self.db.release(key)
+                    await self._dry_run(doc, anime, item)
                     return M.DRY_RUN_OK
-                await self.db.set_state(key, M.AVAILABLE, candidate=item.to_doc())
+                await self.db.set_state(key, M.AVAILABLE, candidate=item.to_doc(), source_status=None,
+                                        last_error=None)
                 doc["candidate"] = item.to_doc()
                 state = M.AVAILABLE
 
-            item = SourceItem.from_doc(doc.get("candidate") or {})
-            container = doc.get("container")
+            # Safety: dry run may have been switched on after this job started. Nothing past this
+            # point (download, upload, post) runs in dry run; the job waits until /dryrun off.
+            if await self.dry_run() or await self.db.is_paused():
+                await self.db.release(key, next_attempt_at=utcnow() + timedelta(
+                    seconds=self.cfg.source_check_interval_seconds))
+                return state
 
-            # 2) get the file locally (skipped for files already on Telegram)
+            item = SourceItem.from_doc(doc.get("candidate") or {})
+
+            # 2) get the file locally (Telegram inbox files skip this unless PROCESS_TELEGRAM_FILES)
             if state in (M.AVAILABLE, M.DOWNLOADING):
-                if await self.db.is_paused():
-                    await self.db.release(key)
-                    return state
-                if item.kind == "telegram":
-                    container = None
+                if item.kind == "telegram" and not self.cfg.process_telegram_files:
+                    await self.db.set_state(key, M.UPLOADING, local_path=None, source_path=None, container=None)
+                    state = M.UPLOADING
                 else:
                     await self.db.set_state(key, M.DOWNLOADING)
-                    local_path = await self._obtain(key, item)
-                    report = await validate_video(local_path, min_bytes=self.cfg.min_file_size_bytes,
-                                                  max_bytes=self.cfg.max_file_size_bytes,
-                                                  expected_size=item.size, expected_sha256=item.sha256,
-                                                  actual_sha256=doc.get("download_sha256"))
-                    container = report.container
-                await self.db.set_state(key, M.UPLOADING, local_path=local_path, container=container)
-                state = M.UPLOADING
+                    src = await self._obtain(key, item)
+                    await validate_video(src, min_bytes=self.cfg.min_file_size_bytes,
+                                         max_bytes=self.cfg.max_file_size_bytes, expected_size=item.size,
+                                         expected_sha256=item.sha256,
+                                         actual_sha256=(await self.db.get_episode(key) or {}).get("download_sha256"))
+                    await self.db.set_state(key, M.PROCESSING, source_path=src)
+                    state = M.PROCESSING
 
-            # 3) upload to storage channel (once)
-            if state == M.UPLOADING:
+            # 3) FFprobe validation + optional remux/transcode (source kept until upload succeeds)
+            if state == M.PROCESSING:
                 fresh = await self.db.get_episode(key)
-                if (not fresh.get("storage") and item.kind != "telegram"
-                        and not (local_path and os.path.isfile(local_path))):
-                    # e.g. dyno restarted and /tmp was wiped: fetch the file again.
-                    await self.db.set_state(key, M.AVAILABLE, local_path=None)
+                src = fresh.get("source_path")
+                if not (src and os.path.isfile(src)):
+                    # Dyno restarted and /tmp was wiped (or the library file moved): fetch again.
+                    await self.db.set_state(key, M.AVAILABLE, source_path=None, local_path=None)
                     await self.db.release(key, next_attempt_at=utcnow())
                     return M.AVAILABLE
+                result = await processing.process(
+                    src, self._job_dir(key), self.cfg, base_name=os.path.splitext(item.file_name)[0],
+                    keepalive=lambda: self.db.renew_lease(key, self.cfg.job_lease_seconds))
+                await self.db.set_state(key, M.UPLOADING, local_path=result.path, container=result.container,
+                                        media=result.info.to_doc(), processing=result.to_doc())
+                state = M.UPLOADING
+
+            # 4) upload to storage channel (once)
+            if state == M.UPLOADING:
+                fresh = await self.db.get_episode(key)
+                local_path = fresh.get("local_path")
+                if (not fresh.get("storage") and not (item.kind == "telegram" and not local_path)
+                        and not (local_path and os.path.isfile(local_path))):
+                    back = M.PROCESSING if fresh.get("source_path") and os.path.isfile(fresh["source_path"]) \
+                        else M.AVAILABLE
+                    await self.db.set_state(key, back, local_path=None)
+                    await self.db.release(key, next_attempt_at=utcnow())
+                    return back
                 if not fresh.get("storage"):
                     storage = await upload_episode(
-                        self.client, self.cfg.storage_channel_id, key, anime, doc["episode"], item, local_path,
-                        timeout_s=self.cfg.upload_timeout_seconds, container=container,
+                        self.client, self.cfg.storage_channel_id, key, anime, doc["episode"], item,
+                        local_path if item.kind != "telegram" or local_path else None,
+                        timeout_s=self.cfg.upload_timeout_seconds, container=fresh.get("container"),
+                        media=fresh.get("media"),
                         keepalive=lambda: self.db.renew_lease(key, self.cfg.job_lease_seconds))
                     token = fresh.get("token") or M.new_episode_token()
                     await self.db.set_state(key, M.UPLOADED, storage=storage, token=token, attempts=0,
                                             last_error=None)
                 else:
                     await self.db.set_state(key, M.UPLOADED)
-                self._cleanup(item, local_path)
-                await self.db.episodes.update_one({"_id": key}, {"$set": {"local_path": None}})
+                # Only now — after Telegram confirmed the upload — remove temporary files.
+                self._cleanup_job(key, item, fresh)
+                await self.db.episodes.update_one({"_id": key}, {"$set": {"local_path": None, "source_path": None}})
                 state = M.UPLOADED
 
-            # 4) publish (exactly once)
+            # 5) publish (exactly once)
             if state == M.UPLOADED:
                 doc = await self.db.get_episode(key)
-                if await self.db.is_paused():
-                    await self.db.release(key)
-                    return M.UPLOADED
                 msg_id = await publish(self.client, self.db, self.cfg, anime, doc, await self.bot_username())
                 await self.db.set_state(key, M.PUBLISHED, post_message_id=msg_id, attempts=0, last_error=None)
                 await self.db.release(key)
@@ -158,15 +175,43 @@ class Pipeline:
         except Exception as e:  # classify and schedule retry
             return await self._handle_failure(doc, anime, e)
 
+    async def _no_source(self, doc, anime, reason) -> str:
+        key = doc["_id"]
+        checks = doc.get("source_checks", 0) + 1
+        wait = min(self.cfg.source_check_interval_seconds * (1 + checks // 6), 1800)
+        fields = {"source_checks": checks, "source_status": reason,
+                  "next_attempt_at": utcnow() + timedelta(seconds=wait)}
+        if reason == M.SOURCE_NOT_CONFIGURED:
+            fields["last_error"] = (f"{M.SOURCE_NOT_CONFIGURED}: no authorized source is enabled. Add one with "
+                                    "/sources add_rss|add_feed|add_dir, or /attach a file you are allowed to share.")
+            await self.notifier.alert(
+                f"⚠️ <b>{M.SOURCE_NOT_CONFIGURED}</b>: <b>{esc(anime.get('title_romaji', key))}</b> episode "
+                f"{doc['episode']} has aired, but no authorized video source is configured. It stays queued; "
+                "nothing was downloaded or posted. Add a licensed source with /sources.",
+                key="source-not-configured")
+        await self.db.release(key, **fields)
+        return M.AIRING
+
+    def _job_dir(self, key: str) -> str:
+        return os.path.join(self.cfg.download_dir, key.replace(":", "_"))
+
     async def _obtain(self, key: str, item: SourceItem) -> str:
         if item.kind == "local":
             if not os.path.isfile(item.ref):
                 raise DownloadError("Local source file disappeared")
             return item.ref
+        job_dir = self._job_dir(key)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", item.file_name)[-120:] or "episode.bin"
+        dest = os.path.join(job_dir, "src_" + safe_name)
+        processing.ensure_disk(job_dir, int(item.size or 0), self.cfg.disk_headroom_mb)
+        if item.kind == "telegram":
+            path = await asyncio.wait_for(
+                self.client.download_media(item.ref, file_name=dest), timeout=self.cfg.download_timeout_seconds)
+            if not path or not os.path.isfile(path):
+                raise DownloadError("Telegram download returned no file")
+            return path
         if item.kind != "url":
             raise DownloadError(f"Unsupported item kind {item.kind}", transient=False)
-        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", item.file_name)[-120:] or "episode.bin"
-        dest = os.path.join(self.cfg.download_dir, key.replace(":", "_") + "_" + safe_name)
         if self._http is None or self._http.closed:
             self._http = make_session()
         adapter = self.sources.adapter_by_name(item.source)
@@ -178,15 +223,66 @@ class Pipeline:
         await self.db.episodes.update_one({"_id": key}, {"$set": {"download_sha256": res.sha256}})
         return res.path
 
-    def _cleanup(self, item: SourceItem, path: Optional[str]) -> None:
-        if not path or not item.owned:
+    def _safe_remove(self, path: Optional[str]) -> None:
+        if not path:
             return
         real = os.path.realpath(path)
         if real.startswith(os.path.realpath(self.cfg.download_dir) + os.sep):
-            with contextlib.suppress(FileNotFoundError):
+            with contextlib.suppress(FileNotFoundError, IsADirectoryError):
                 os.remove(real)
 
-    async def _dry_run_report(self, doc, anime, item: SourceItem) -> None:
+    def _cleanup_job(self, key: str, item: Optional[SourceItem], doc: Optional[dict]) -> None:
+        """Delete temp files for a job. Library files (owned=False) are never deleted."""
+        doc = doc or {}
+        proc = doc.get("processing") or {}
+        if proc.get("created"):
+            self._safe_remove(proc.get("path"))
+        local = doc.get("local_path")
+        src = doc.get("source_path")
+        if item is None or item.owned:
+            self._safe_remove(src)
+            if local and local != (item.ref if item else None):
+                self._safe_remove(local)
+        job_dir = os.path.realpath(self._job_dir(key))
+        if os.path.isdir(job_dir):
+            with contextlib.suppress(OSError):
+                os.rmdir(job_dir)       # only if empty
+
+    # Back-compat helper used by older code paths/tests.
+    def _cleanup(self, item: SourceItem, path: Optional[str]) -> None:
+        if path and item.owned:
+            self._safe_remove(path)
+
+    async def _dry_run(self, doc, anime, item: SourceItem) -> None:
+        """Report what would happen. Never uploads or posts. Optionally tests download + FFmpeg."""
+        key = doc["_id"]
+        report = ""
+        can_fetch = item.kind != "telegram" or self.cfg.process_telegram_files
+        if self.cfg.dry_run_process and can_fetch:
+            src = None
+            result = None
+            try:
+                src = await self._obtain(key, item)
+                await validate_video(src, min_bytes=self.cfg.min_file_size_bytes,
+                                     max_bytes=self.cfg.max_file_size_bytes, expected_size=item.size,
+                                     expected_sha256=item.sha256)
+                result = await processing.process(src, self._job_dir(key), self.cfg,
+                                                  base_name=os.path.splitext(item.file_name)[0])
+                i = result.info
+                report = (f"\n\n✅ Download + FFmpeg check passed: action=<b>{result.action}</b>, "
+                          f"{esc(i.video_codec)} {i.width}x{i.height}, audio={esc(','.join(i.audio_codecs))}, "
+                          f"{i.duration:.0f}s, {human_size(os.path.getsize(result.path))}.")
+            except Exception as e:  # report, never upload
+                report = f"\n\n❌ Dry-run processing failed: {esc(type(e).__name__)}: {esc(str(e)[:300])}"
+            finally:
+                fake = {"processing": result.to_doc() if result else {}, "source_path": src,
+                        "local_path": result.path if result else None}
+                self._cleanup_job(key, item, fake)
+        await self._dry_run_report(doc, anime, item, report)
+        await self.db.set_state(key, M.DRY_RUN_OK, candidate=item.to_doc())
+        await self.db.release(key)
+
+    async def _dry_run_report(self, doc, anime, item: SourceItem, extra: str = "") -> None:
         try:
             template = await self.db.get_caption(anime["_id"]) or DEFAULT_TEMPLATE
             preview = render(template, caption_values(anime, {**doc, "candidate": item.to_doc()}, self.cfg,
@@ -195,7 +291,8 @@ class Pipeline:
             preview = f"(caption error: {esc(e)})"
         await self.notifier.alert(
             f"🧪 <b>DRY RUN</b> — would upload <code>{esc(item.file_name)}</code> from source "
-            f"<b>{esc(item.source)}</b> for <code>{esc(doc['_id'])}</code>.\n\nCaption preview:\n\n{preview}")
+            f"<b>{esc(item.source)}</b> for <code>{esc(doc['_id'])}</code>. Nothing was uploaded or posted."
+            f"{extra}\n\nCaption preview:\n\n{preview}")
 
     async def _handle_failure(self, doc, anime, exc: Exception) -> str:
         key = doc["_id"]
@@ -206,7 +303,6 @@ class Pipeline:
         msg = f"{type(exc).__name__}: {exc}"
         await self.db.record_error(key, stage, msg, attempts)
         log.warning("Episode %s failed at %s (attempt %s): %s", key, stage, attempts, msg)
-        local_path = fresh.get("local_path")
         title = esc(anime.get("title_romaji", key))
 
         if isinstance(exc, AmbiguousPublish):
@@ -214,23 +310,30 @@ class Pipeline:
             await self.db.release(key)
             await self.notifier.alert(f"⚠️ Publish of <b>{title}</b> could not be confirmed.\n{esc(exc)}")
             return M.FAILED
-        if isinstance(exc, (InvalidFile, UnsafeURL)) or (isinstance(exc, DownloadError) and not exc.transient):
+        if isinstance(exc, (InvalidFile, UnsafeURL)) or (isinstance(exc, DownloadError) and not exc.transient) \
+                or (isinstance(exc, processing.ProcessingError) and not exc.transient):
             # Reject this candidate; go back to waiting for a good authorized file.
             item = SourceItem.from_doc(fresh.get("candidate") or {}) if fresh.get("candidate") else None
-            if item:
-                self._cleanup(item, local_path)
+            self._cleanup_job(key, item, fresh)
             nxt = M.AIRING if attempts < self.cfg.max_retries else M.FAILED
-            await self.db.set_state(key, nxt, candidate=None, local_path=None, attempts=attempts, last_error=msg,
+            await self.db.set_state(key, nxt, candidate=None, local_path=None, source_path=None, processing=None,
+                                    attempts=attempts, last_error=msg,
                                     next_attempt_at=utcnow() + timedelta(seconds=backoff_seconds(attempts)))
             await self.db.release(key)
             await self.notifier.alert(f"🚫 Rejected file for <b>{title}</b> ep {doc['episode']}: {esc(exc)}",
                                       key=f"reject:{key}")
             return nxt
+        if isinstance(exc, processing.FFmpegMissing):
+            await self.notifier.alert(f"🎞 {esc(exc)}", key="ffmpeg-missing")
         if isinstance(exc, PERMISSION_ERRORS):
             await self.notifier.alert(f"🔒 Telegram permission problem while processing <b>{title}</b>: "
                                       f"{esc(exc)}\nMake sure the bot is an admin in the storage and post "
                                       f"channels.", key="perm")
         if attempts >= self.cfg.max_retries or (isinstance(exc, UploadError) and not exc.transient):
+            if not fresh.get("storage"):
+                item = SourceItem.from_doc(fresh["candidate"]) if fresh.get("candidate") else None
+                self._cleanup_job(key, item, fresh)
+                await self.db.episodes.update_one({"_id": key}, {"$set": {"local_path": None, "source_path": None}})
             await self.db.set_state(key, M.FAILED, attempts=attempts, last_error=msg)
             await self.db.release(key)
             await self.notifier.alert(f"❌ <b>{title}</b> ep {doc['episode']} failed after {attempts} attempts: "
@@ -239,6 +342,8 @@ class Pipeline:
         # Transient: keep state (download restarts from scratch; upload is skipped if already stored).
         back_state = state if state in M.WORKABLE_STATES else M.AIRING
         if back_state == M.DOWNLOADING:
+            back_state = M.AVAILABLE
+        if back_state == M.PROCESSING and not (fresh.get("source_path") and os.path.isfile(fresh["source_path"])):
             back_state = M.AVAILABLE
         await self.db.release(key, state=back_state, attempts=attempts, last_error=msg,
                               next_attempt_at=utcnow() + timedelta(seconds=backoff_seconds(attempts)))
@@ -303,8 +408,9 @@ class Pipeline:
             await self._http.close()
 
     def _clean_stale_parts(self):
-        with contextlib.suppress(FileNotFoundError):
-            for f in os.listdir(self.cfg.download_dir):
-                if f.endswith(".part"):
+        """Remove half-written downloads/encodes left by a crash (finished files are kept for resume)."""
+        for root, _dirs, files in os.walk(self.cfg.download_dir):
+            for f in files:
+                if f.endswith(".part") or ".part." in f:
                     with contextlib.suppress(OSError):
-                        os.remove(os.path.join(self.cfg.download_dir, f))
+                        os.remove(os.path.join(root, f))

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 
-from pyrogram import Client, filters
+from pyrogram import Client, enums, filters
 from pyrogram.errors import FloodWait, RPCError
 from pyrogram.handlers import CallbackQueryHandler, ChatJoinRequestHandler, ChatMemberUpdatedHandler, MessageHandler
 
@@ -134,6 +134,10 @@ async def help_handler(ctx, client, message):
         "Send me a document, video, audio, photo or animation.\n"
         "I will return a permanent share link while its record remains in the database.\n\n"
         "Got here from a GET EPISODE button? Just tap it again after joining the required channels.")
+    uid = message.from_user.id if message.from_user else None
+    if ctx.is_admin(uid):
+        from .admin import ADMIN_HELP
+        await message.reply_text(ADMIN_HELP, parse_mode=enums.ParseMode.HTML)
 
 
 async def join_request_handler(ctx, client, request):

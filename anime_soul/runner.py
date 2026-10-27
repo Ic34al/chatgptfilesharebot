@@ -18,7 +18,8 @@ from pyrogram import Client
 
 from database import FileDB
 
-from .config import Config, load_config
+from . import processing
+from .config import Config, ConfigError, load_config
 from .context import Ctx
 from .db import AnimeDB
 from .fsub import FsubChecker
@@ -42,8 +43,22 @@ def build_client(cfg: Config, role: str) -> Client:
                   no_updates=(role == "pipeline"))
 
 
-async def preflight(client: Client, cfg: Config, notifier: Notifier) -> None:
-    """Warn early if the bot can't use the configured channels."""
+async def preflight(client: Client, cfg: Config, notifier: Notifier, sources=None) -> None:
+    """Warn early about channels, FFmpeg and sources. Never prints secrets."""
+    tools = processing.tools_available()
+    if cfg.process_mode != "off" and not all(tools.values()):
+        missing = ", ".join(k for k, v in tools.items() if not v)
+        level = "Uploads are blocked until it is installed" if cfg.ffmpeg_required else \
+            "Files will be uploaded without stream validation (FFMPEG_REQUIRED=false)"
+        await notifier.alert(f"🎞 FFmpeg tools missing: {missing}. {level}. Heroku: add buildpack "
+                             "https://github.com/heroku/heroku-buildpack-activestorage-preview", key="ffmpeg-missing")
+    if sources is not None:
+        with contextlib.suppress(Exception):
+            if await sources.configured_count() == 0:
+                await notifier.alert("⚠️ SOURCE_NOT_CONFIGURED: no authorized video source is enabled. Episodes "
+                                     "will be detected and queued, but nothing can be downloaded or posted until "
+                                     "you add one with /sources (or /attach files you may share).",
+                                     key="source-not-configured")
     me = await client.get_me()
     for label, chat in (("storage", cfg.storage_channel_id), ("post", cfg.post_channel_id)):
         if chat is None:
@@ -63,7 +78,12 @@ async def preflight(client: Client, cfg: Config, notifier: Notifier) -> None:
 
 
 async def run(role_override: str | None = None) -> None:
-    cfg = load_config()
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        logging.basicConfig(level="INFO")
+        log.error("Invalid config: %s", e)
+        sys.exit(2)
     if role_override:
         cfg = Config(**{**cfg.__dict__, "role": role_override})
     setup_logging(cfg.log_level, cfg.log_json)
@@ -95,7 +115,7 @@ async def run(role_override: str | None = None) -> None:
     tasks = []
     pipeline = None
     if cfg.role in ("all", "pipeline"):
-        ctx.monitor = ReleaseMonitor(cfg, db, notifier, anilist=anilist)
+        ctx.monitor = ReleaseMonitor(cfg, db, notifier, anilist=anilist, sources=sources)
         pipeline = Pipeline(cfg, db, client, notifier, sources)
         ctx.pipeline = pipeline
     if cfg.role in ("all", "bot"):
@@ -107,7 +127,7 @@ async def run(role_override: str | None = None) -> None:
     me = await client.get_me()
     log.info("Started as @%s (role=%s, dry_run=%s)", me.username, cfg.role, cfg.dry_run)
     if cfg.role in ("all", "pipeline"):
-        await preflight(client, cfg, notifier)
+        await preflight(client, cfg, notifier, sources)
         tasks.append(asyncio.create_task(ctx.monitor.run(stop), name="monitor"))
         tasks.append(asyncio.create_task(pipeline.run(stop), name="pipeline"))
 

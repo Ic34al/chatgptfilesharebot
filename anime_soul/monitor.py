@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import timedelta
 from typing import Optional
@@ -10,6 +11,7 @@ from typing import Optional
 from . import models as M
 from .config import Config
 from .db import AnimeDB
+from .matcher import matches_episode
 from .schedule import AniListProvider, JikanProvider, ScheduleError
 from .tg import Notifier, esc
 from .timeutil import fmt_ist, utcnow
@@ -19,8 +21,10 @@ log = logging.getLogger(__name__)
 
 class ReleaseMonitor:
     def __init__(self, cfg: Config, db: AnimeDB, notifier: Notifier,
-                 anilist: Optional[AniListProvider] = None, jikan: Optional[JikanProvider] = None):
+                 anilist: Optional[AniListProvider] = None, jikan: Optional[JikanProvider] = None,
+                 sources=None):
         self.cfg = cfg
+        self.sources = sources
         self.db = db
         self.notifier = notifier
         self.anilist = anilist or AniListProvider()
@@ -28,7 +32,7 @@ class ReleaseMonitor:
 
     async def poll_once(self) -> dict:
         """One monitor cycle. Returns counters (useful for tests and /status)."""
-        stats = {"new": 0, "rescheduled": 0, "aired": 0, "delayed": 0, "sequels": 0, "errors": 0}
+        stats = {"new": 0, "rescheduled": 0, "aired": 0, "delayed": 0, "sequels": 0, "errors": 0, "feed_new": 0}
         anime = await self.db.list_anime(active_only=True)
         now = utcnow()
         if anime:
@@ -59,12 +63,47 @@ class ReleaseMonitor:
                     await self.notifier.alert(
                         f"🕒 Rescheduled: <b>{esc(title)}</b> episode {s.episode} → {fmt_ist(s.airing_at)}",
                         key=f"resched:{s.anime_id}:{s.episode}:{int(s.airing_at.timestamp())}")
+        if anime and self.sources is not None and self.cfg.feed_detect_releases:
+            await self._detect_from_feeds(anime, now, stats)
         aired = await self.db.mark_aired(now)
         stats["aired"] = len(aired)
         stats["delayed"] = await self._check_delays(now)
         await self.db.heartbeat("monitor")
         await self.db.set_setting("monitor:last_stats", {"at": now, **stats})
         return stats
+
+    async def _detect_from_feeds(self, anime, now, stats) -> None:
+        """Authorized feeds are also release signals: a new feed item for a tracked anime creates
+        the episode even if AniList has no airing slot for it (e.g. simulcast delays, specials)."""
+        from .sources.base import SourceUnavailable
+        oldest = now - timedelta(hours=self.cfg.lookback_hours)
+        for ad in await self.sources.feed_adapters():
+            try:
+                releases = await ad.releases()
+            except SourceUnavailable as e:
+                stats["errors"] += 1
+                log.warning("Feed %s unavailable during release check: %s", ad.name, e)
+                continue
+            for rel in releases:
+                released = rel.get("released_at") or now
+                if released < oldest:
+                    continue          # never backfill a whole catalogue
+                for a in anime:
+                    try:
+                        ok = matches_episode(a, int(rel["episode"]), title=rel.get("title"),
+                                             anime_id=rel.get("anilist_id"), ep=rel.get("episode"),
+                                             quality=rel.get("quality"), language=rel.get("language"),
+                                             season=rel.get("season"))
+                    except (TypeError, ValueError):
+                        ok = False
+                    if not ok:
+                        continue
+                    res = await self.db.upsert_schedule(a["_id"], int(rel["episode"]), min(released, now),
+                                                        f"feed:{ad.name}", estimated=True)
+                    if res == "new":
+                        stats["feed_new"] += 1
+                        log.info("Feed %s announced %s episode %s", ad.name, a["_id"], rel["episode"])
+                    break
 
     async def _refresh_info(self, ids, stats) -> None:
         try:
@@ -119,8 +158,14 @@ class ReleaseMonitor:
     async def run(self, stop: asyncio.Event) -> None:
         log.info("Release monitor started (interval %ss)", self.cfg.poll_interval_seconds)
         backoff = 5
+        ttl = max(120, self.cfg.poll_interval_seconds * 3)
         while not stop.is_set():
             try:
+                if not await self.db.acquire_lock("monitor", ttl):
+                    holder = await self.db.lock_holder("monitor")
+                    log.info("Another release monitor is active (%s); this one stays idle", holder)
+                    await self._wait(stop, self.cfg.poll_interval_seconds)
+                    continue
                 stats = await self.poll_once()
                 log.info("Monitor cycle: %s", stats)
                 backoff = 5
@@ -130,6 +175,8 @@ class ReleaseMonitor:
                 wait = backoff
                 backoff = min(backoff * 2, 300)
             await self._wait(stop, wait)
+        with contextlib.suppress(Exception):
+            await self.db.release_lock("monitor")
 
     @staticmethod
     async def _wait(stop: asyncio.Event, seconds: float) -> None:

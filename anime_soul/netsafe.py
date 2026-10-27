@@ -117,6 +117,21 @@ async def _open(session, url, allowlist, allow_http, headers=None, max_redirects
     raise DownloadError("Too many redirects", transient=False)
 
 
+async def fetch_bytes(session, url: str, allowlist, allow_http=False, headers=None, max_bytes=2 * 1024 * 1024) -> bytes:
+    resp = await _open(session, url, allowlist, allow_http, headers)
+    try:
+        if resp.status >= 500 or resp.status == 429:
+            raise DownloadError(f"Feed HTTP {resp.status}")
+        if resp.status != 200:
+            raise DownloadError(f"Feed HTTP {resp.status}", transient=False)
+        body = await resp.content.read(max_bytes + 1)
+        if len(body) > max_bytes:
+            raise DownloadError("Feed too large", transient=False)
+        return body
+    finally:
+        resp.release()
+
+
 async def fetch_json(session, url: str, allowlist, allow_http=False, headers=None, max_bytes=2 * 1024 * 1024):
     resp = await _open(session, url, allowlist, allow_http, headers)
     try:
