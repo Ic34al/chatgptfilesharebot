@@ -1,0 +1,18 @@
+{
+  "name": "telegram-file-share-bot",
+  "description": "Fast Telegram file sharing bot using Telegram file IDs and MongoDB metadata.",
+  "buildpacks": [
+    {"url": "heroku/python"}
+  ],
+  "formation": {
+    "worker": {"quantity": 1, "size": "basic"}
+  },
+  "env": {
+    "API_ID": {"description": "Telegram API ID"},
+    "API_HASH": {"description": "Telegram API hash"},
+    "BOT_TOKEN": {"description": "BotFather bot token", "required": true},
+    "MONGODB_URI": {"description": "MongoDB connection URI", "required": true},
+    "DATABASE_NAME": {"description": "MongoDB database name", "value": "file_share_bot"},
+    "OWNER_ID": {"description": "Telegram numeric owner ID"}
+  }
+}
