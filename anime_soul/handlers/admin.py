@@ -33,7 +33,7 @@ HTML = enums.ParseMode.HTML
 ADMIN_COMMANDS = ["status", "queue", "anime", "addanime", "removeanime", "setanime", "pending", "retry", "pause",
                   "resume",
                   "broadcast", "captions", "sources", "testupload", "attach", "setthumb", "dryrun", "stats",
-                  "adminhelp"]
+                  "adminhelp", "checkfiles", "reupload", "events", "schedule"]
 
 ADMIN_HELP = """<b>ANIME SOUL admin commands</b>
 /status – monitor, worker, FFmpeg &amp; source health
@@ -45,6 +45,10 @@ ADMIN_HELP = """<b>ANIME SOUL admin commands</b>
 /pending – pending/failed jobs and upcoming episodes
 /retry &lt;anilist:ID:EP | ID EP&gt; [publish]  (IDs are shown by /queue, e.g. anilist:154587:5)
 /pause · /resume · /dryrun on|off
+/events &lt;anilist:ID:EP&gt; – recent pipeline events (state changes, errors)
+/checkfiles [count] – check that stored episode messages still exist in the storage channel
+/reupload &lt;anilist:ID:EP&gt; – re-upload a published episode whose stored file is gone (keeps the post and link)
+/schedule – preview today's airing timetable (IST)
 /attach &lt;id&gt; &lt;episode&gt; [quality] – reply to an authorized video/file
 /setthumb &lt;id&gt; – reply to a photo (or: /setthumb &lt;id&gt; none)
 /captions – list · show/set/preview/reset &lt;id|default&gt;
@@ -120,8 +124,27 @@ async def cmd_status(ctx, client, m):
     err = await ctx.db.get_setting("monitor:last_error") or {}
     dry = await ctx.db.get_setting("dry_run", None)
     dry = ctx.cfg.dry_run if dry is None else dry
+    try:
+        mongo = f"ok ({await ctx.db.ping():.0f} ms)"
+    except Exception as e:  # noqa: BLE001 - shown to the admin, redacted
+        mongo = f"ERROR {type(e).__name__}"
+    public = {}
+    for state, n in counts.items():
+        if n and state != M.FAILED:
+            label = M.public_state({"state": state})
+            public[label] = public.get(label, 0) + n
+    failures = await ctx.db.count_failure_codes()
+    try:
+        free = shutil.disk_usage(ctx.cfg.download_dir if os.path.isdir(ctx.cfg.download_dir) else "/tmp").free
+        disk = f"{free / 1024 ** 3:.1f} GB free"
+    except OSError:
+        disk = "unknown"
     lines = [
         "<b>ANIME SOUL status</b>",
+        f"MongoDB: {mongo} · Temp disk: {disk}",
+        "Pipeline: " + (" · ".join(f"{k}={public[k]}" for k in (*M.PUBLIC_STATES, "DRY_RUN_OK") if public.get(k))
+                        or "empty"),
+        "Failures: " + (" · ".join(f"{k}={v}" for k, v in sorted(failures.items())) or "none"),
         f"Role: <code>{ctx.cfg.role}</code> · Paused: <b>{'yes' if await ctx.db.is_paused() else 'no'}</b>"
         f" · Dry run: <b>{'on' if dry else 'off'}</b>",
         f"Monitor heartbeat: {_age(hb_mon.get('at'))} · Pipeline heartbeat: {_age(hb_pipe.get('at'))}",
@@ -137,6 +160,12 @@ async def cmd_status(ctx, client, m):
     if ctx.sources is not None:
         n = await ctx.sources.configured_count()
         lines.append(f"Authorized sources enabled: {n}" + (f" — <b>{M.SOURCE_NOT_CONFIGURED}</b>" if n == 0 else ""))
+        for d in await ctx.db.list_sources(enabled_only=True):
+            ok = "ok" if d.get("last_ok") else ("never checked" if d.get("last_ok") is None else "ERROR")
+            back = f" · backoff until {fmt_ist(d['retry_at'])}" if d.get("retry_at") and \
+                ensure_utc(d["retry_at"]) > utcnow() else ""
+            lines.append(f"  • {esc(d['_id'])}: {ok} · last success {_age(d.get('last_success_at'))}"
+                         f"{' · fails ' + str(d['fail_count']) if d.get('fail_count') else ''}{back}")
     holder = await ctx.db.lock_holder("monitor")
     lines.append(f"Monitor lock: {esc(holder) if holder else 'free'}")
     if err:
@@ -154,7 +183,9 @@ async def cmd_queue(ctx, client, m):
         out = ["Queue is empty. /pending shows failed jobs and upcoming episodes."]
     for d in rows:
         note = d.get("source_status") or ""
-        if d.get("last_error"):
+        if d.get("failure_code"):
+            note = d["failure_code"] + (": " + (d.get("last_error") or "")[:80] if d.get("last_error") else "")
+        elif d.get("last_error"):
             note = (d.get("last_error") or "")[:90]
         nxt = f" · next {fmt_ist(d['next_attempt_at'])}" if d.get("next_attempt_at") else ""
         out.append(f"• <code>{esc(d['_id'])}</code> {esc(titles.get(d.get('anime_id'), ''))} "
@@ -288,6 +319,75 @@ async def cmd_retry(ctx, client, m):
     ok = await ctx.db.reset_for_retry(key, include_publish="publish" in rest)
     await m.reply_text(f"🔁 Queued <code>{key}</code> for retry." if ok else "Not found or already published.",
                        parse_mode=HTML)
+
+
+async def cmd_events(ctx, client, m):
+    try:
+        key, _ = _episode_key_from(_args(m))
+    except ValueError as e:
+        await m.reply_text(str(e))
+        return
+    rows = await ctx.db.recent_events(key, 20)
+    if not rows:
+        await m.reply_text("No events recorded for that episode.")
+        return
+    out = [f"<b>Events for</b> <code>{esc(key)}</code> (newest first)"]
+    for r in rows:
+        detail = r.get("state") or r.get("failure_code") or ""
+        err = f" — {esc(redact(str(r['error']))[:120])}" if r.get("error") else ""
+        out.append(f"• {fmt_ist(r.get('at'))} {esc(r.get('event'))} {esc(detail)}{err}")
+    await m.reply_text(_join_limit(out), parse_mode=HTML)
+
+
+async def cmd_checkfiles(ctx, client, m):
+    """Verify stored messages still exist (deleted storage messages break GET EPISODE)."""
+    args = _args(m)
+    limit = min(int(args[0]), 100) if args and args[0].isdigit() else 20
+    rows = await ctx.db.episodes.find({"state": {"$in": [M.PUBLISHED, M.UPLOADED]}}).sort(
+        "updated_at", -1).to_list(length=limit)
+    missing, checked = [], 0
+    for d in rows:
+        st = d.get("storage") or {}
+        if not st.get("chat_id") or not st.get("message_id"):
+            continue
+        checked += 1
+        try:
+            msg = await call_with_flood(client.get_messages, st["chat_id"], st["message_id"])
+        except RPCError as e:
+            missing.append((d["_id"], f"{type(e).__name__}"))
+            continue
+        if msg is None or getattr(msg, "empty", False) or not any(
+                getattr(msg, a, None) for a in ("video", "document", "animation")):
+            missing.append((d["_id"], "message deleted or has no media"))
+            await ctx.db.mark_upload_status(d["_id"], "missing", "storage message deleted")
+    out = [f"Checked {checked} stored episode(s)."]
+    if missing:
+        out.append("<b>Missing / inaccessible:</b>")
+        out += [f"• <code>{esc(k)}</code> — {esc(r)} → /reupload {esc(k)}" for k, r in missing]
+    else:
+        out.append("✅ All checked storage messages are present.")
+    await m.reply_text(_join_limit(out), parse_mode=HTML)
+
+
+async def cmd_reupload(ctx, client, m):
+    try:
+        key, _ = _episode_key_from(_args(m))
+    except ValueError as e:
+        await m.reply_text(str(e))
+        return
+    state = await ctx.db.prepare_reupload(key)
+    if not state:
+        await m.reply_text("Not found, or the episode was never uploaded (use /retry instead).")
+        return
+    await m.reply_text(
+        f"🔁 <code>{esc(key)}</code> queued for re-upload ({esc(M.STATE_LABELS.get(state, state))}). The existing "
+        "channel post and GET EPISODE link are kept; no new announcement is posted. If the original authorized "
+        "file is no longer available, /attach it again.", parse_mode=HTML)
+
+
+async def cmd_schedule(ctx, client, m):
+    from ..schedule_post import build_schedule_text
+    await m.reply_text(await build_schedule_text(ctx.db), parse_mode=HTML, disable_web_page_preview=True)
 
 
 async def cmd_pause(ctx, client, m):

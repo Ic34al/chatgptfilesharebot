@@ -120,6 +120,12 @@ class ReleaseMonitor:
         aired = await self.db.mark_aired(now)
         stats["aired"] = len(aired)
         stats["delayed"] = await self._check_delays(now)
+        if getattr(self.cfg, "schedule_post_enabled", False):
+            from .schedule_post import maybe_post_schedule
+            dry = await self.db.get_setting("dry_run", None)
+            stats["schedule_posted"] = await maybe_post_schedule(
+                self.cfg, self.db, self.notifier.client, self.notifier,
+                self.cfg.dry_run if dry is None else bool(dry), now)
         await self.db.heartbeat("monitor")
         await self.db.set_setting("monitor:last_stats", {"at": now, **stats})
         return stats

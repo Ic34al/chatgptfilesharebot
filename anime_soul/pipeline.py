@@ -199,7 +199,9 @@ class Pipeline:
             if state == M.UPLOADED:
                 doc = await self.db.get_episode(key)
                 msg_id = await publish(self.client, self.db, self.cfg, anime, doc, await self.bot_username())
-                await self.db.set_state(key, M.PUBLISHED, post_message_id=msg_id, attempts=0, last_error=None,
+                # msg_id is None when the post already exists (e.g. after /reupload): keep the old post.
+                await self.db.set_state(key, M.PUBLISHED, post_message_id=msg_id or doc.get("post_message_id"),
+                                        attempts=0, last_error=None,
                                         failure_code=None)
                 await self.db.mark_upload_status(key, "published")
                 await self.db.release(key)

@@ -329,6 +329,34 @@ class AnimeDB:
             "lease_owner": None, "lease_until": None, "updated_at": utcnow()}})
         return True
 
+    async def prepare_reupload(self, key: str) -> Optional[str]:
+        """Re-acquire and re-upload a published episode whose stored file is gone.
+        The deep-link token and the channel post are kept, so existing GET EPISODE buttons keep working
+        and no second announcement is made. Returns the new state, or None if not possible."""
+        doc = await self.get_episode(key)
+        if not doc or not (doc.get("storage") or doc.get("state") == M.PUBLISHED):
+            return None
+        new_state = M.AVAILABLE if doc.get("candidate") else M.AIRING
+        await self.uploads.update_one({"episode_key": key}, {"$set": {"status": "replaced", "status_at": utcnow()}})
+        await self.uploads.delete_one({"episode_key": key, "status": "replaced"})
+        await self.episodes.update_one({"_id": key}, {"$set": {
+            "state": new_state, "storage": None, "previous_storage": doc.get("storage"), "attempts": 0,
+            "next_attempt_at": utcnow(), "last_error": None, "failure_code": None, "delivery_error": None,
+            "lease_owner": None, "lease_until": None, "local_path": None, "source_path": None,
+            "updated_at": utcnow()}})
+        await self.event(key, "reupload_requested", previous_state=doc.get("state"))
+        return new_state
+
+    async def count_failure_codes(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        q = {"$or": [{"state": M.FAILED}, {"failure_code": {"$ne": None}, "state": {"$ne": M.PUBLISHED}}]}
+        async for row in self.episodes.aggregate([{"$match": q},
+                                                  {"$group": {"_id": "$failure_code", "n": {"$sum": 1}}}]):
+            out[row["_id"] or "FAILED"] = row["n"]
+        out[M.SOURCE_NOT_CONFIGURED] = await self.episodes.count_documents(
+            {"state": M.AIRING, "source_status": M.SOURCE_NOT_CONFIGURED})
+        return {k: v for k, v in out.items() if v}
+
     # ------------------------------------------------------------------ posts
     async def claim_post(self, key: str, chat_id) -> bool:
         """Insert a post claim. False if the episode was already (being) posted."""
