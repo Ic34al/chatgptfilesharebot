@@ -133,3 +133,30 @@ GPL-3.0 derivative. Only design patterns were reused, reimplemented from scratch
 - Collection names in the brief differ from production. The production collections are kept and the mapping is documented.
 - `failed` stays one internal state, with `failure_code` alongside, so existing documents and `/retry` keep working.
 - Old `candidate` documents without the new fields still load (defaults).
+
+## Fourth audit — AutoAnimeBot upload engine integration (28 Oct 2026, branch `feature/telegram-channel-source`)
+
+Reference: kaif-00z/AutoAnimeBot @47caf18 (GPL-3.0, Telethon). Read: `bot.py`, `core/bot.py`, `core/executors.py`,
+`libs/subsplease.py`, `libs/ariawarp.py`, `libs/logger.py`, `database/__init__.py`, `functions/{info,schedule,tools,config}.py`.
+Its files come from SubsPlease magnet links downloaded with aria2c. That gives no redistribution permission, so
+it is not used. Its automatic flow is reused with a Telegram channel where a licensed provider uploads files.
+
+### File-by-file changes
+| File | Change |
+|---|---|
+| `anime_soul/sources/telegram_channel.py` | **New.** `TelegramChannelSource`: ingest, validate, parse, match, dedupe, catch-up, `/assign` |
+| `anime_soul/handlers/source_ingest.py` | **New.** Live channel/group post handler (handler group 7, registered chats only) |
+| `anime_soul/reporter.py` | **New.** Optional `LOG_CHANNEL_ID` job progress message |
+| `anime_soul/sources/adapters.py` | `build_adapter(..., db)` builds `telegram_channel`; `SourceRegistry.channel_adapters()` |
+| `anime_soul/db.py` | `telegram_source_files` collection + indexes; `state_listeners` hook in `set_state` |
+| `anime_soul/monitor.py` | `_provider_channels()` step in the existing cycle (catch-up + rematch; no new loop) |
+| `anime_soul/pipeline.py` | Registers the reporter when `LOG_CHANNEL_ID` is set (no flow change) |
+| `anime_soul/handlers/admin.py` | `/sources add_tg`, `/sources scan`, `/unmatched`, `/assign`; help text |
+| `anime_soul/runner.py` | Registers `source_ingest` handlers in the bot role |
+| `anime_soul/config.py` | `LOG_CHANNEL_ID`, `TG_SOURCE_SCAN_LIMIT` |
+| `anime_soul/netsafe.py` | Downloads refuse non-video `Content-Type` (HTML/JSON pages) |
+| `tests/test_telegram_source.py` | **New.** 22 tests |
+| `.env.example`, docs | New variables, setup steps, integration map |
+
+Unchanged: `/start` and file sharing, deep-link format and old links, FSUB + Try Again, broadcast, `/attach`,
+channel IDs, existing collections and episode IDs, post layout and branding, `Procfile`, `app.json`, `DRY_RUN`.

@@ -8,11 +8,12 @@ New features:
 - **Automatic discovery** of currently airing TV/TV_SHORT/ONA anime from AniList (`AUTO_DISCOVER_AIRING_ANIME`, most popular first). Discovery only adds schedules — never video URLs.
 - **Release detection** from AniList and from authorized partner RSS/Atom/JSON feeds; duplicate-safe.
 - **Authorized sources only**: admin uploads (`/attach`), allow-listed partner RSS/Atom or JSON feeds, or a local licensed library. No scraping, no torrents, no DRM bypass. With no source configured, episodes wait as `SOURCE_NOT_CONFIGURED`.
+- **Provider Telegram channel (fully automatic)**: a licensed provider uploads episodes to a private intake channel where the bot is admin; each file is checked, matched to the anime and episode, copied to storage and published with GET EPISODE — no `/attach`. Missed posts are read after downtime. `/sources add_tg`, `/sources scan`, `/unmatched`, `/assign`. Optional `LOG_CHANNEL_ID` progress messages.
 - **FFmpeg processing**: FFprobe validation (video/audio streams, duration, size), lossless MKV → MP4 remux when possible, optional transcode/downscale, disk and timeout limits.
 - **Validated uploads** to a private storage channel (size, container signature, checksum, FFprobe).
 - **Channel posts** with thumbnail, HTML caption templates and a **GET EPISODE** button that opens the bot's delivery flow.
 - **Force-subscribe (FSUB)** on one or more channels, optional join-request mode, TRY AGAIN button.
-- **Admin controls**: `/status /queue /help /anime /addanime /removeanime /setanime /pending /retry /pause /resume /broadcast /captions /sources /testupload /attach /setthumb /dryrun /stats /adminhelp /events /checkfiles /reupload /schedule`.
+- **Admin controls**: `/status /queue /help /anime /addanime /removeanime /setanime /pending /retry /pause /resume /broadcast /captions /sources /testupload /attach /setthumb /dryrun /stats /adminhelp /events /checkfiles /reupload /schedule /unmatched /assign`.
 - **Ongoing-release system** ([docs/RELEASE_SYSTEM.md](docs/RELEASE_SYSTEM.md)): one adapter interface for every source (`health/find/download/validate`), release history in `episode_releases`, feed retries with exponential backoff, catch-up after downtime, batch/v2/language parsing, `telegram_uploads` and `pipeline_events` records, typed failure codes, recovery for deleted storage messages, optional daily IST schedule post.
 - **Safe 24/7 operation**: MongoDB leases (no duplicate uploads or posts), single-monitor lock, bounded retries with back-off, delay alerts, FloodWait handling, restart recovery, graceful shutdown, dry-run mode (default on) and `/testupload full`.
 
