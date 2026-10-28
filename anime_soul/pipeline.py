@@ -46,6 +46,9 @@ class Pipeline:
         self._http = None
         self._bot_username: Optional[str] = None
         self._tasks: set[asyncio.Task] = set()
+        if getattr(cfg, "log_channel_id", None) is not None:
+            from .reporter import JobReporter
+            db.state_listeners.append(JobReporter(client, cfg.log_channel_id, db).on_state)
 
     async def bot_username(self) -> str:
         if not self._bot_username:
