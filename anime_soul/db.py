@@ -320,9 +320,18 @@ class AnimeDB:
         res = await self.sources.delete_one({"_id": name})
         return res.deleted_count > 0
 
-    async def source_status(self, name: str, ok: bool, error: Optional[str] = None) -> None:
-        await self.sources.update_one({"_id": name}, {"$set": {"last_check": utcnow(), "last_ok": ok,
-                                                               "last_error": (error or "")[:500]}})
+    async def source_status(self, name: str, ok: bool, error: Optional[str] = None) -> int:
+        """Record a health check. Returns the number of consecutive failures (0 when ok)."""
+        now = utcnow()
+        if ok:
+            await self.sources.update_one({"_id": name}, {"$set": {
+                "last_check": now, "last_ok": True, "last_error": "", "last_success_at": now,
+                "fail_count": 0, "retry_at": None}})
+            return 0
+        doc = await self.sources.find_one_and_update(
+            {"_id": name}, {"$set": {"last_check": now, "last_ok": False, "last_error": (error or "")[:500]},
+                            "$inc": {"fail_count": 1}}, return_document=ReturnDocument.AFTER)
+        return int((doc or {}).get("fail_count") or 1)
 
     # ------------------------------------------------------------------ inbox
     async def add_inbox_file(self, key: str, data: Dict[str, Any]) -> None:
