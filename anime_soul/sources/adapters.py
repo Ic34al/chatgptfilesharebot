@@ -193,7 +193,10 @@ class HttpFeedSource(SourceAdapter):
         for it in await self.items():
             if not isinstance(it, dict) or not it.get("url") or it.get("episode") is None:
                 continue
-            out.append({**it, "released_at": _parse_time(it.get("released_at"))})
+            if it.get("is_batch"):
+                continue
+            out.append({**it, "released_at": _parse_time(it.get("released_at")),
+                        "release_id": release_id_of(self.name, it), "version": _version(it)})
         return out
 
     async def health(self):

@@ -91,6 +91,8 @@ class Config:
     source_check_interval_seconds: int = 300
     lookahead_hours: int = 48
     lookback_hours: int = 72
+    reconcile_max_hours: int = 168        # catch-up window after downtime (AniList + feeds)
+    feed_alert_after_failures: int = 5    # admin alert after N consecutive feed failures
     delay_alert_minutes: int = 180
     source_giveup_hours: int = 168
     max_retries: int = 8
@@ -194,6 +196,8 @@ def load_config() -> Config:
         source_check_interval_seconds=max(30, _int("SOURCE_CHECK_INTERVAL_SECONDS", 300)),
         lookahead_hours=_int("LOOKAHEAD_HOURS", 48),
         lookback_hours=_int("LOOKBACK_HOURS", 72),
+        reconcile_max_hours=max(1, _int("RECONCILE_MAX_HOURS", 168)),
+        feed_alert_after_failures=max(1, _int("FEED_ALERT_AFTER_FAILURES", 5)),
         delay_alert_minutes=_int("DELAY_ALERT_MINUTES", 180),
         source_giveup_hours=_int("SOURCE_GIVEUP_HOURS", 168),
         max_retries=_int("MAX_RETRIES", 8),

@@ -15,7 +15,7 @@ from .db import AnimeDB
 from .matcher import matches_episode
 from .schedule import AniListProvider, JikanProvider, ScheduleError
 from .tg import Notifier, esc
-from .timeutil import fmt_ist, utcnow
+from .timeutil import ensure_utc, fmt_ist, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -87,7 +87,9 @@ class ReleaseMonitor:
                 )
         if anime:
             ids = [a["_id"] for a in anime]
-            start = now - timedelta(hours=self.cfg.lookback_hours)
+            # Reconcile after downtime: look back to the last successful check (bounded), so
+            # episodes that aired while the bot was offline are still picked up.
+            start = self.reconcile_start(now, await self.db.get_setting("monitor:last_ok"))
             end = now + timedelta(hours=self.cfg.lookahead_hours)
             slots = []
             try:
@@ -122,22 +124,62 @@ class ReleaseMonitor:
         await self.db.set_setting("monitor:last_stats", {"at": now, **stats})
         return stats
 
+    def reconcile_start(self, now, last_ok):
+        """Start of the window to check: normal lookback, extended back to the last successful
+        check after downtime, but never further than RECONCILE_MAX_HOURS (no catalogue backfill)."""
+        start = now - timedelta(hours=self.cfg.lookback_hours)
+        last_ok = _aware(last_ok)
+        if last_ok is not None and last_ok - timedelta(hours=1) < start:
+            start = max(last_ok - timedelta(hours=1), now - timedelta(hours=self.cfg.reconcile_max_hours))
+        return start
+
     async def _detect_from_feeds(self, anime, now, stats) -> None:
         """Authorized feeds are also release signals: a new feed item for a tracked anime creates
-        the episode even if AniList has no airing slot for it (e.g. simulcast delays, specials)."""
+        the episode even if AniList has no airing slot for it (e.g. simulcast delays, specials).
+
+        Every release seen is recorded once in ``episode_releases`` (duplicate detection). After
+        downtime the window extends back to the feed's last successful check. A feed only lists its
+        newest N entries, so if the oldest entry is newer than the last check we alert that some
+        releases may have been missed instead of silently skipping them."""
         from .sources.base import SourceUnavailable
-        oldest = now - timedelta(hours=self.cfg.lookback_hours)
+        stats.setdefault("feed_releases_new", 0)
         for ad in await self.sources.feed_adapters():
+            if self.sources.in_backoff(ad.name):
+                stats["errors"] += 1
+                continue
+            src_doc = await self.db.sources.find_one({"_id": ad.name}) or {}
+            last_ok = _aware(src_doc.get("last_success_at"))
             try:
                 releases = await ad.releases()
             except SourceUnavailable as e:
                 stats["errors"] += 1
-                log.warning("Feed %s unavailable during release check: %s", ad.name, e)
+                fails = await self.sources.mark_failed(ad.name, str(e))
+                log.warning("Feed %s unavailable during release check (%s in a row): %s", ad.name, fails, e)
+                if fails >= self.cfg.feed_alert_after_failures:
+                    await self.notifier.alert(
+                        f"📡 Feed <b>{esc(ad.name)}</b> has failed {fails} checks in a row: {esc(str(e)[:200])}\n"
+                        "Retrying with exponential backoff. Check /sources.", key=f"feed-down:{ad.name}")
                 continue
+            await self.sources.mark_ok(ad.name)
+            oldest = self.reconcile_start(now, last_ok)
+            dated = [r["released_at"] for r in releases if r.get("released_at")]
+            if last_ok and dated and min(dated) > last_ok and len(releases) >= 5:
+                await self.notifier.alert(
+                    f"⚠️ Feed <b>{esc(ad.name)}</b>: its oldest entry ({fmt_ist(min(dated))}) is newer than the "
+                    f"last successful check ({fmt_ist(last_ok)}). Releases published in between may be missing "
+                    "from the feed. Check them manually and /attach any authorized file.",
+                    key=f"feed-gap:{ad.name}:{now:%Y%m%d}")
             for rel in releases:
                 released = rel.get("released_at") or now
                 if released < oldest:
                     continue          # never backfill a whole catalogue
+                rid = rel.get("release_id")
+                if rid:
+                    known = await self.db.record_release(rid, ad.name, rel, released)
+                    if known and known.get("matched_key"):
+                        continue      # duplicate: already matched to an episode earlier
+                    if not known:
+                        stats["feed_releases_new"] += 1
                 for a in anime:
                     try:
                         ok = matches_episode(a, int(rel["episode"]), title=rel.get("title"),
@@ -150,6 +192,8 @@ class ReleaseMonitor:
                         continue
                     res = await self.db.upsert_schedule(a["_id"], int(rel["episode"]), min(released, now),
                                                         f"feed:{ad.name}", estimated=True)
+                    if rid:
+                        await self.db.match_release(rid, M.episode_key(a["_id"], int(rel["episode"])))
                     if res == "new":
                         stats["feed_new"] += 1
                         log.info("Feed %s announced %s episode %s", ad.name, a["_id"], rel["episode"])
@@ -252,3 +296,8 @@ class ReleaseMonitor:
             await asyncio.wait_for(stop.wait(), timeout=seconds)
         except asyncio.TimeoutError:
             pass
+
+
+def _aware(dt):
+    from datetime import datetime
+    return ensure_utc(dt) if isinstance(dt, datetime) else None
