@@ -141,6 +141,8 @@ class Config:
     schedule_post_enabled: bool = False     # daily IST airing timetable post (off by default)
     schedule_post_time: str = "00:30"       # HH:MM, Asia/Kolkata
     schedule_channel_id: Optional[ChatRef] = None   # default: POST_CHANNEL_ID
+    log_channel_id: Optional[ChatRef] = None        # optional per-job progress messages (off when unset)
+    tg_source_scan_limit: int = 1000                # max missed provider-channel posts read per monitor cycle
 
     @property
     def all_admin_ids(self) -> Tuple[int, ...]:
@@ -177,6 +179,7 @@ def load_config() -> Config:
     post = os.getenv("POST_CHANNEL_ID", "").strip()
     test_chat = os.getenv("TEST_CHANNEL_ID", "").strip()
     sched_chat = os.getenv("SCHEDULE_CHANNEL_ID", "").strip()
+    log_chat = os.getenv("LOG_CHANNEL_ID", "").strip()
     sched_time = os.getenv("SCHEDULE_POST_TIME", "00:30").strip() or "00:30"
     import re as _re
     if not _re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", sched_time):
@@ -255,4 +258,6 @@ def load_config() -> Config:
         schedule_post_enabled=_bool("SCHEDULE_POST_ENABLED", False),
         schedule_post_time=sched_time,
         schedule_channel_id=_chat_ref(sched_chat) if sched_chat else None,
+        log_channel_id=_chat_ref(log_chat) if log_chat else None,
+        tg_source_scan_limit=min(5000, max(100, _int("TG_SOURCE_SCAN_LIMIT", 1000))),
     )

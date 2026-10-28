@@ -117,6 +117,8 @@ class ReleaseMonitor:
                         key=f"resched:{s.anime_id}:{s.episode}:{int(s.airing_at.timestamp())}")
         if anime and self.sources is not None and self.cfg.feed_detect_releases:
             await self._detect_from_feeds(anime, now, stats)
+        if self.sources is not None:
+            await self._provider_channels(stats)
         aired = await self.db.mark_aired(now)
         stats["aired"] = len(aired)
         stats["delayed"] = await self._check_delays(now)
@@ -129,6 +131,32 @@ class ReleaseMonitor:
         await self.db.heartbeat("monitor")
         await self.db.set_setting("monitor:last_stats", {"at": now, **stats})
         return stats
+
+    async def _provider_channels(self, stats) -> None:
+        """Telegram provider channels: read posts missed while offline, retry unmatched files.
+        Live posts are handled instantly by handlers/source_ingest.py; this is the catch-up path."""
+        try:
+            channels = await self.sources.channel_adapters()
+        except Exception:  # noqa: BLE001
+            log.exception("Could not load provider channels")
+            return
+        for ad in channels:
+            if self.sources.in_backoff(ad.name):
+                continue
+            try:
+                got = await ad.catch_up(self.notifier.client, self.notifier,
+                                        max_messages=self.cfg.tg_source_scan_limit)
+                stats["provider_files"] = stats.get("provider_files", 0) + got["new"]
+                stats["provider_rematched"] = stats.get("provider_rematched", 0) + await ad.rematch_unmatched()
+                await self.sources.mark_ok(ad.name)
+            except Exception as e:  # noqa: BLE001 - one bad channel must not stop the monitor
+                log.warning("Provider channel %s catch-up failed: %s", ad.name, e)
+                stats["errors"] += 1
+                fails = await self.sources.mark_failed(ad.name, f"catch-up failed: {e}")
+                if fails >= self.cfg.feed_alert_after_failures:
+                    await self.notifier.alert(
+                        f"⚠️ Provider channel <b>{esc(ad.name)}</b> can't be read ({esc(str(e)[:200])}). "
+                        "Is the bot still an admin there?", key=f"tgsrc-fail:{ad.name}")
 
     def reconcile_start(self, now, last_ok):
         """Start of the window to check: normal lookback, extended back to the last successful

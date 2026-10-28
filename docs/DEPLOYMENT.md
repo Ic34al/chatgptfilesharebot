@@ -156,12 +156,34 @@ into one message instead of one per episode. Turn it off with `AUTO_DISCOVER_AIR
 
 Add an authorized source (one of). Until you do, aired episodes stay queued with
 **`SOURCE_NOT_CONFIGURED`** (shown in `/queue`, `/status` and an owner alert) — nothing is faked:
+- **Provider Telegram channel (fully automatic, recommended):** a provider who has licensed the episodes
+  to you uploads them into a Telegram channel; the bot picks up each new file, matches it to the anime and
+  episode, copies it to the storage channel and publishes the post with GET EPISODE — no `/attach`.
+  On iPhone:
+  1. Telegram → New Channel → private, e.g. "ANIME SOUL intake". Invite the provider (or their upload bot) as
+     an admin who can post.
+  2. Channel → Administrators → Add Admin → your bot. Bots only receive channel posts when they are admins.
+  3. Find the channel ID: forward one post from the channel to your bot's owner chat with a helper such as
+     @username_to_id_bot, or open the channel in web.telegram.org and use the number after `#` with `-100` in front.
+  4. In your bot: `/sources add_tg partner -1001234567890 | Licence agreement #123 with Partner Ltd`
+     (the bot checks that it is an admin there).
+  5. Already posted files: `/sources scan partner 1` (reads from message 1 onwards).
+  The provider should name files like `[Partner] Frieren S2 - 05 [1080p].mkv`, or put
+  `#anilist154587` and `Episode 5` in the caption. Files that can't be matched are listed in `/unmatched`
+  and you fix them with `/assign <chat:msg> <anilist id> <episode>`. Files must be videos (MKV/MP4/…), at
+  most `MAX_FILE_SIZE_MB` and at least `MIN_DURATION_SECONDS`; batches are rejected.
+  Use a separate intake channel — never your storage or post channel.
 - **Admin upload:** reply to the episode file you are licensed to share with `/attach <id> <episode> [quality]`.
 - **Partner RSS/Atom feed** (each item needs a direct-download `<enclosure>`; torrents/magnets are ignored):
   set `ALLOWED_SOURCE_HOSTS=cdn.partner.com`, then
   `/sources add_rss partner https://cdn.partner.com/anime-soul.rss | Licence agreement #123 with Partner`
 - **Partner JSON feed:** set `ALLOWED_SOURCE_HOSTS=cdn.partner.com`, then
   `/sources add_feed partner https://cdn.partner.com/anime-soul.json | Licence agreement #123 with Partner`
+  If the provider's API needs a key, put it in a Heroku Config Var (e.g. `PARTNER_API_KEY=Bearer abc…`) and add
+  `auth_env=PARTNER_API_KEY` after the URL: `/sources add_feed partner https://… auth_env=PARTNER_API_KEY | Licence …`.
+  The key is never stored in MongoDB or shown in logs. Downloads are refused if the host isn't in
+  `ALLOWED_SOURCE_HOSTS` (also after redirects), resolves to a private/loopback address, is larger than
+  `MAX_FILE_SIZE_MB`, or returns a non-video content type (e.g. an HTML login page); the file is then checked with FFprobe.
 - **Server directory (VPS only):** set `LOCAL_SOURCE_ROOTS=/srv/library`, then
   `/sources add_dir library /srv/library/ongoing | Our own licensed library`
 

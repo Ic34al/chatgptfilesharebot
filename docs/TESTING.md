@@ -1,5 +1,24 @@
 # Testing report and live demonstration checklist
 
+## Update — Telegram provider channel source (28 Oct 2026, branch `feature/telegram-channel-source`)
+
+`python -m pytest -q` → **213 passed, 4 skipped** (mongomock). With a real MongoDB 7.0
+(`REAL_MONGODB_URI=mongodb://127.0.0.1:27099`) → **217 passed**. `pyflakes` clean.
+
+New `tests/test_telegram_source.py` (22 tests): video/document detection; caption and `#anilist` parsing;
+authorization and numeric chat ID required; `/sources add_tg` refuses missing licence, non-admin bot and the
+storage channel; non-admins can't add sources; **full flow** provider post → episode queued → `send_cached_media`
+to storage → one post with GET EPISODE (`?start=<token>`) → `/start` blocked until FSUB joined → delivered;
+unregistered chats and non-videos ignored; too large / too short / batch rejected and never uploaded; duplicate
+message, re-posted file and post-publication copies don't upload or post again; quality + v2 preference;
+unmatched alert + `/assign`; rematch after `/addanime`; monitor catch-up after downtime (stops at an empty batch,
+no reprocessing); catch-up failure → backoff + alert; `/sources scan` backfill; temporary upload errors retried;
+permanent upload error → `UPLOAD_FAILED`, no post; dry run never uploads; progress log edits one message and
+leaks no file IDs; HTML/JSON content types rejected and the partial file removed; two dynos receiving the same
+post queue it once.
+
+Not verified: a real provider channel, a real Telegram upload, or a Heroku deployment of this branch.
+
 ## Update — ongoing-release system (28 Oct 2026, branch `feature/ongoing-release-system`)
 
 | Run | Result |

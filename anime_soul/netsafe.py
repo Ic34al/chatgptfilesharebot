@@ -155,6 +155,23 @@ class DownloadResult:
     sha256: str
 
 
+# Content types a media download may have. Servers often send a generic binary type for .mkv files,
+# so those are accepted too; the file is still checked with FFprobe afterwards (validate.py).
+MEDIA_CONTENT_TYPES = ("application/octet-stream", "binary/octet-stream", "application/x-matroska",
+                       "application/mp4", "application/force-download",
+                       "application/download")
+
+
+def media_content_type_problem(content_type: Optional[str]) -> Optional[str]:
+    """Reason to reject a download by its Content-Type, or None. A missing header is allowed."""
+    if not content_type:
+        return None
+    ct = content_type.split(";", 1)[0].strip().lower()
+    if ct.startswith("video/") or ct in MEDIA_CONTENT_TYPES:
+        return None
+    return f"Source returned {ct}, not a video file (login page, error page or wrong link?)"
+
+
 async def download(session, url: str, dest: str, allowlist, *, allow_http=False, max_bytes: int,
                    timeout_s: int, headers=None, on_progress=None) -> DownloadResult:
     """Stream ``url`` to ``dest`` atomically (``dest.part`` then rename)."""
@@ -173,6 +190,9 @@ async def download(session, url: str, dest: str, allowlist, *, allow_http=False,
                 raise DownloadError(f"Access denied ({resp.status}); check source credentials", transient=False)
             if resp.status >= 400:
                 raise DownloadError(f"HTTP {resp.status}", transient=resp.status >= 500 or resp.status == 429)
+            ctype = media_content_type_problem(resp.headers.get("Content-Type"))
+            if ctype:
+                raise DownloadError(ctype, transient=False)
             declared = resp.headers.get("Content-Length")
             if declared and declared.isdigit() and int(declared) > max_bytes:
                 raise DownloadError(f"File larger than limit ({int(declared)} bytes)", transient=False)

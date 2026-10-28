@@ -132,3 +132,77 @@ admins only. `/schedule` previews it.
 | `?start=<id>` deep link to the stored message | Existing opaque `?start=<token>` (kept for backward compatibility) |
 | aria2 torrent downloader | Not adopted (no authorization model) |
 | Static FFmpeg in Docker | Heroku FFmpeg buildpack (already in `app.json`) |
+
+## Provider Telegram channel — automatic file intake (`anime_soul/sources/telegram_channel.py`)
+
+This is ANIME SOUL's version of AutoAnimeBot's automatic flow (**new release → get file → upload to storage → post
+with button**). AutoAnimeBot gets files by reading the SubsPlease RSS feed and downloading torrents with aria2.
+That source gives no permission to redistribute, so here the release feed **and** the file host is a Telegram
+channel where a licensed provider uploads episodes.
+
+```
+provider posts video in intake channel ──► handlers/source_ingest.py (live, bot dyno)
+          │ (missed while offline)            │
+          └──► monitor._provider_channels ────┤  catch_up(): get_messages by ID after last_message_id
+                                              ▼
+            TelegramChannelSource.ingest(): video type / size / duration / batch check
+            → parse file name + caption (title, S/E, quality, v2, #anilist tag)
+            → telegram_source_files (unique per source + file_unique_id = no duplicates)
+            → match tracked anime → upsert episode (AIRING, woken now) + episode_releases
+                                              ▼
+            existing pipeline: find() → SourceItem(kind="telegram", ref=file_id)
+            → UPLOADING: send_cached_media to STORAGE_CHANNEL_ID (no re-download;
+              PROCESS_TELEGRAM_FILES=true downloads + FFprobe/FFmpeg first)
+            → telegram_uploads record → publish to POST_CHANNEL_ID with GET EPISODE (?start=<token>)
+            → /start <token>: FSUB check → direct delivery (unchanged)
+```
+
+* Collection **`telegram_source_files`**: `_id` = `"<chat_id>:<message_id>"`, `source`, `file_id`,
+  `file_unique_id` (unique per source), `file_name`, `file_size`, `mime_type`, `duration`, `width/height`,
+  parsed `title/episode/season/quality/language/version/is_batch/anilist_id`, `status` (`ok`, `unmatched`,
+  `rejected`), `reject_reason`, `matched_key`, `posted_at`. The source document stores `last_message_id`
+  and `last_file_at`.
+* Choosing between several files for one episode: the tracked quality first, then the highest version (v2), then
+  the highest resolution, then the newest post. After an episode is published, later copies are ignored (the
+  episode state and the `telegram_uploads` record block a second upload or post).
+* Rejected (never uploaded): non-video documents, files above `MAX_FILE_SIZE_MB` / below `MIN_FILE_SIZE_MB`,
+  videos shorter than `MIN_DURATION_SECONDS`, batch releases. Unmatched files are kept, the owner is alerted
+  once, they are retried every monitor cycle (e.g. after `/addanime`), and `/assign` fixes them by hand.
+* Errors: a catch-up failure (bot removed as admin, etc.) uses the same source backoff as feeds
+  (60 s doubling to 1 h) and alerts after `FEED_ALERT_AFTER_FAILURES`. Upload errors use the existing retry
+  and `UPLOAD_FAILED` handling; nothing is posted until Telegram confirms the storage upload.
+* Duplicate processing on Heroku: live posts are only handled by the dyno that runs the bot handlers
+  (`worker`); if two dynos ever receive the same post, the unique `_id` lets only one queue it, and the
+  episode lease (`claim_next`) lets only one pipeline upload it.
+* Limits: Telegram bots can't read channel history, only messages by ID, so catch-up reads ID ranges after the
+  last seen post and stops at the first empty batch of 100 (the `/sources scan` command tolerates 3 empty batches).
+  Bots can download files up to 20 MB with the Bot API, but this bot uses MTProto (Pyrogram), so
+  `PROCESS_TELEGRAM_FILES=true` works up to Telegram's 2 GB (4 GB Premium) file limit — on a 0.5 GB-RAM
+  Heroku dyno keep it off unless you need FFmpeg.
+
+## Optional progress log (`anime_soul/reporter.py`)
+
+Adapted from AutoAnimeBot's `Reporter`: with `LOG_CHANNEL_ID` set, each job gets one message in that channel
+that is edited as the state changes (File found → Downloading → Validating → Processing → Uploading → DONE / Failed
+with the error). The message ID is saved on the episode, so edits continue after a restart. It never shows
+file IDs, tokens or credentials. Off by default.
+
+## AutoAnimeBot integration map (kaif-00z/AutoAnimeBot @47caf18, GPL-3.0)
+
+| AutoAnimeBot file / function | What it does there | ANIME SOUL | Status |
+|---|---|---|---|
+| `libs/subsplease.py` `SubsPlease.feed_optimizer/on_new_anime` | Polls 3 SubsPlease RSS feeds every 5 s, anitopy parse, skip `[Batch]`, sha256 uid | `monitor.py` + `sources/adapters.py` (authorized RSS/JSON), `sources/telegram_channel.py` (Telegram provider) | Adapted (idea), SubsPlease not used |
+| `database` `is_anime_uploaded` / `store_items` | Hash-based "already done" check | `episode_releases`, `telegram_source_files` unique index, `telegram_uploads`, episode state | Adapted (idea) |
+| `libs/ariawarp.py` `Torrent.download_magnet` | aria2c magnet/torrent download | — | **Not adopted**: torrents give no redistribution right, aria2 isn't on Heroku, and it skips the host/size checks |
+| `bot.py` `anime()` | feed → info → torrent → executor → post with button | `pipeline.py` state machine (existing) | Already existed; new source plugs into it |
+| `core/executors.py` `Executors.execute` | rename or FFmpeg encode, upload to backup channel, `?start=<msg.id>` button | `pipeline.py`, `processing.py`, `uploader.py`, `publisher.py` | Existing; deep-link format **kept** as `?start=<token>` |
+| `core/bot.py` `upload_anime` | Pyrogram `send_document` to a channel | `uploader.upload_episode` (`send_cached_media` for Telegram files) | Existing |
+| `libs/logger.py` `Reporter` | Edits one log message per job | `reporter.py` `JobReporter` | Adapted (rewritten) |
+| `functions/schedule.py` | Daily IST timetable | `schedule_post.py` | Adapted earlier (PR #3) |
+| `functions/info.py` `AnimeInfo` | AniList metadata | `schedule/anilist.py` (existing) | Already existed |
+| Multi-quality 480/720/1080 buttons, screenshots/sample clip | Extra post buttons / media | — | Not adopted: would change the post layout and episode schema |
+| Telethon client | Bot framework | Pyrogram (existing) | Not adopted |
+
+**Copied verbatim: nothing.** Adapted: the automatic flow, duplicate checks, batch skipping, job progress reporter,
+daily timetable. New: the Telegram provider source, `/sources add_tg|scan`, `/unmatched`, `/assign`, the
+download content-type check.

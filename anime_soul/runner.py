@@ -125,9 +125,10 @@ async def run(role_override: str | None = None) -> None:
         pipeline = Pipeline(cfg, db, client, notifier, sources)
         ctx.pipeline = pipeline
     if cfg.role in ("all", "bot"):
-        from .handlers import admin, user
+        from .handlers import admin, source_ingest, user
         admin.register(client, ctx)   # admin first so /attach captions aren't treated as share uploads
         user.register(client, ctx)
+        source_ingest.register(client, ctx)   # provider channels (separate handler group)
 
     await client.start()
     me = await client.get_me()
