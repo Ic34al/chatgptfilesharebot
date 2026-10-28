@@ -134,6 +134,15 @@ class SourceAdapter(abc.ABC):
         async def progress(_n):
             if ctx.keepalive:
                 await ctx.keepalive()
+        from ..hls import download_hls, is_hls_url
+        if is_hls_url(item.ref) or (item.extra or {}).get("format") == "hls":
+            # Authorized provider streaming as HLS: segments are fetched through the same safety checks,
+            # encrypted/DRM streams are refused, FFmpeg remuxes locally.
+            path = await download_hls(ctx.http(), item.ref, destination, cfg.allowed_source_hosts,
+                                      allow_http=cfg.allow_http_sources, max_bytes=cfg.max_file_size_bytes,
+                                      timeout_s=cfg.download_timeout_seconds, headers=self.headers() or None,
+                                      quality=item.quality, on_progress=progress)
+            return DownloadOutcome(path, None, os.path.getsize(path))
         res = await download(ctx.http(), item.ref, destination, cfg.allowed_source_hosts,
                              allow_http=cfg.allow_http_sources, max_bytes=cfg.max_file_size_bytes,
                              timeout_s=cfg.download_timeout_seconds, headers=self.headers() or None,

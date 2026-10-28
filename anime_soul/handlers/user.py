@@ -75,8 +75,24 @@ async def report_delivery_failure(ctx, kind: str, doc: dict, err: Exception) -> 
             key=f"delivery:{key}")
 
 
+async def _banned(ctx, user_id) -> bool:
+    from .extras import is_banned
+    return await is_banned(ctx, user_id)
+
+
+async def _after_delivery(ctx, client, chat_id, sent, user_id) -> None:
+    from .extras import after_delivery
+    try:
+        await after_delivery(ctx, client, chat_id, sent, user_id)
+    except Exception:  # noqa: BLE001 - never break delivery because of the auto-delete queue
+        log.debug("auto-delete scheduling failed", exc_info=True)
+
+
 async def start_handler(ctx, client, message):
     user_id = message.from_user.id if message.from_user else None
+    if await _banned(ctx, user_id):
+        await message.reply_text("⛔ You are banned from using this bot.")
+        return
     if user_id:
         try:
             await ctx.db.touch_user(user_id)
@@ -84,6 +100,14 @@ async def start_handler(ctx, client, message):
             log.debug("touch_user failed", exc_info=True)
     raw_parts = (message.text or "").split(maxsplit=1)
     if len(raw_parts) < 2:
+        pics = getattr(ctx.cfg, "start_pics", ())
+        if pics:   # optional rotating welcome picture (AutoAnime.zip START_PIC / RESPONSE_IMAGES)
+            import random
+            try:
+                await message.reply_photo(random.choice(pics), caption=WELCOME)
+                return
+            except RPCError as e:
+                log.warning("START_PICS image rejected (%s); sending text welcome", e)
         await message.reply_text(WELCOME)
         return
     token = parse_start_payload(message.text)
@@ -98,16 +122,21 @@ async def start_handler(ctx, client, message):
                                      disable_web_page_preview=True)
             return
     try:
-        await send_resolved(ctx, client, message.chat.id, kind, doc)
+        sent = await send_resolved(ctx, client, message.chat.id, kind, doc)
     except FloodWait:
         await message.reply_text("⏳ Telegram is rate-limiting me. Please try again in a minute.")
     except (RPCError, ValueError) as e:
         log.warning("Delivery failed for token %s…: %s", token[:6], e)
         await report_delivery_failure(ctx, kind, doc, e)
         await message.reply_text("⚠️ Sorry, I couldn't send this file right now. Please try again later.")
+    else:
+        await _after_delivery(ctx, client, message.chat.id, sent, user_id)
 
 
 async def try_again_handler(ctx, client, query):
+    if await _banned(ctx, query.from_user.id if query.from_user else None):
+        await query.answer("⛔ You are banned from using this bot.", show_alert=True)
+        return
     data = query.data or ""
     token = data.split(":", 1)[1] if ":" in data else ""
     kind, doc = await resolve_token(ctx, token)
@@ -128,18 +157,23 @@ async def try_again_handler(ctx, client, query):
     except RPCError:
         pass
     try:
-        await send_resolved(ctx, client, query.from_user.id, kind, doc)
+        sent = await send_resolved(ctx, client, query.from_user.id, kind, doc)
     except FloodWait:
         await client.send_message(query.from_user.id, "⏳ Telegram is rate-limiting me. Please try again in a minute.")
     except (RPCError, ValueError) as e:
         log.warning("Delivery after TRY AGAIN failed: %s", e)
         await report_delivery_failure(ctx, kind, doc, e)
         await client.send_message(query.from_user.id, "⚠️ Sorry, I couldn't send this file right now.")
+    else:
+        await _after_delivery(ctx, client, query.from_user.id, sent, query.from_user.id)
 
 
 async def file_handler(ctx, client, message):
     """Original feature: send a file in private chat → get a share link."""
     if not ctx.cfg.public_file_links and not ctx.is_admin(message.from_user.id if message.from_user else None):
+        return
+    if await _banned(ctx, message.from_user.id if message.from_user else None):
+        await message.reply_text("⛔ You are banned from using this bot.")
         return
     media = message.document or message.video or message.audio or message.photo or message.animation
     unique_id = getattr(media, "file_unique_id", "")

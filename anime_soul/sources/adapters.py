@@ -181,10 +181,15 @@ class HttpFeedSource(SourceAdapter):
             version = _version(it)
             if best is not None and version <= best.version:
                 continue
-            best = SourceItem(self.name, "url", it["url"], os.path.basename(name), size=_size(it.get("size")),
-                              sha256=it.get("sha256"), quality=it.get("quality"), language=it.get("language"),
+            hls = str(it.get("format") or "").lower() == "hls" or name.lower().endswith((".m3u8", ".m3u"))
+            if hls:   # HLS stream from the provider: remuxed to one MKV file (anime_soul/hls.py)
+                name = os.path.splitext(name)[0] + ".mkv"
+            best = SourceItem(self.name, "url", it["url"], os.path.basename(name),
+                              size=None if hls else _size(it.get("size")),
+                              sha256=None if hls else it.get("sha256"), quality=it.get("quality"),
+                              language=it.get("language"),
                               anime_id=int(anime["_id"]), episode=int(episode), version=version,
-                              release_id=release_id_of(self.name, it))
+                              release_id=release_id_of(self.name, it), extra={"format": "hls"} if hls else {})
         return best
 
     async def releases(self) -> list:

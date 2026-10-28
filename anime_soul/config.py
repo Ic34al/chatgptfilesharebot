@@ -143,6 +143,7 @@ class Config:
     schedule_channel_id: Optional[ChatRef] = None   # default: POST_CHANNEL_ID
     log_channel_id: Optional[ChatRef] = None        # optional per-job progress messages (off when unset)
     tg_source_scan_limit: int = 1000                # max missed provider-channel posts read per monitor cycle
+    start_pics: Tuple[str, ...] = ()                # optional welcome pictures (random), from START_PICS
 
     @property
     def all_admin_ids(self) -> Tuple[int, ...]:
@@ -260,4 +261,6 @@ def load_config() -> Config:
         schedule_channel_id=_chat_ref(sched_chat) if sched_chat else None,
         log_channel_id=_chat_ref(log_chat) if log_chat else None,
         tg_source_scan_limit=min(5000, max(100, _int("TG_SOURCE_SCAN_LIMIT", 1000))),
+        start_pics=tuple(u.strip() for u in os.getenv("START_PICS", "").split(",")
+                         if u.strip().startswith("https://")),
     )

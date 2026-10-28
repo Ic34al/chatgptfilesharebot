@@ -15,6 +15,7 @@ New features:
 - **Force-subscribe (FSUB)** on one or more channels, optional join-request mode, TRY AGAIN button.
 - **Admin controls**: `/status /queue /help /anime /addanime /removeanime /setanime /pending /retry /pause /resume /broadcast /captions /sources /testupload /attach /setthumb /dryrun /stats /adminhelp /events /checkfiles /reupload /schedule /unmatched /assign`.
 - **Ongoing-release system** ([docs/RELEASE_SYSTEM.md](docs/RELEASE_SYSTEM.md)): one adapter interface for every source (`health/find/download/validate`), release history in `episode_releases`, feed retries with exponential backoff, catch-up after downtime, batch/v2/language parsing, `telegram_uploads` and `pipeline_events` records, typed failure codes, recovery for deleted storage messages, optional daily IST schedule post.
+- **AutoAnime.zip features** ([docs/AUTOANIME_INTEGRATION.md](docs/AUTOANIME_INTEGRATION.md)): `/ban /unban /banned`, `/addadmin /rmadmin /admins` (owner only), `/users`, richer `/stats`, `/autodel` (delivered files deleted after a delay, survives restarts), `/ping`, `/restart`, `/manage` settings panel, mapped per-anime channels (`/setmap /unmap /maplist`), public `/ongoing` and `/search` (library search with GET EPISODE deep links), bot command menu, optional `START_PICS`, and HLS (`.m3u8`) downloads from **authorized** providers (encrypted/DRM streams refused). The zip's site scrapers, proxies/Tor and N_m3u8DL-RE were not used.
 - **Safe 24/7 operation**: MongoDB leases (no duplicate uploads or posts), single-monitor lock, bounded retries with back-off, delay alerts, FloodWait handling, restart recovery, graceful shutdown, dry-run mode (default on) and `/testupload full`.
 
 Pipeline: `DETECTED → QUEUED → DOWNLOADING → VALIDATING → PROCESSING → UPLOADING → PUBLISHED`.
@@ -23,6 +24,7 @@ Failures: `SOURCE_NOT_CONFIGURED, DOWNLOAD_FAILED, VALIDATION_FAILED, PROCESSING
 ## Docs
 - [docs/AUDIT.md](docs/AUDIT.md) — what was in the repository, what was wrong, and the file-by-file plans
 - [docs/RELEASE_SYSTEM.md](docs/RELEASE_SYSTEM.md) — sources, lifecycle, collections, monitoring, delivery
+- [docs/AUTOANIME_INTEGRATION.md](docs/AUTOANIME_INTEGRATION.md) — every AutoAnime.zip file: adapted or not adopted, and why
 - [CREDITS.md](CREDITS.md) — attribution (AutoAnimeBot design reference, GPL-3.0) and licences
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — Telegram, MongoDB Atlas, GitHub and Heroku steps from an iPhone, troubleshooting, costs and limits
 - [docs/TESTING.md](docs/TESTING.md) — automated test report and live demonstration checklist

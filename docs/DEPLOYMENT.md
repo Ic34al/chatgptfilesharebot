@@ -187,6 +187,23 @@ Add an authorized source (one of). Until you do, aired episodes stay queued with
 - **Server directory (VPS only):** set `LOCAL_SOURCE_ROOTS=/srv/library`, then
   `/sources add_dir library /srv/library/ongoing | Our own licensed library`
 
+- **Partner HLS stream** (some licensed providers serve `.m3u8` instead of one file): in the JSON feed give the
+  item `"format": "hls"` (or a URL ending in `.m3u8`). Every playlist and segment host must be in
+  `ALLOWED_SOURCE_HOSTS`. Encrypted/DRM streams (`#EXT-X-KEY`) are **refused**. Ask the provider for an
+  unencrypted stream or a file. FFmpeg joins the segments into one MKV, so the FFmpeg buildpack is required.
+
+Extra tools (from AutoAnime.zip; details in docs/AUTOANIME_INTEGRATION.md). All are typed in the bot chat,
+so nothing needs to change in Heroku:
+- `/manage` – buttons to pause uploads, switch dry run, set auto-delete, turn mapped posts on or off.
+- `/autodel 600` – files a user receives are deleted after 10 minutes (`/autodel 0` = off). Admins are exempt.
+- `/ban 123456 spam` · `/unban 123456` · `/banned` · `/users`.
+- `/addadmin 123456` · `/rmadmin 123456` (owner only) · `/admins`.
+- `/setmap -1001234567890 154587` – also post that anime's episodes in another channel (make the bot an admin there first).
+- `/restart` – restarts the bot process safely. `/ping` – quick health check (anyone).
+- Users get `/search <name>` (episodes you already published) and `/ongoing` (today's schedule).
+- Optional Config Var `START_PICS` = one or more `https://` image URLs, comma-separated, for a random
+  picture on `/start`. Leave it unset to keep the plain welcome text.
+
 Test the whole path safely first:
 1. `DRY_RUN=true` + `DRY_RUN_PROCESS=true` → when an episode is found the bot downloads it, runs
    FFprobe/FFmpeg and sends you a report. Nothing is uploaded or posted.

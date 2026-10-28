@@ -134,6 +134,17 @@ GPL-3.0 derivative. Only design patterns were reused, reimplemented from scratch
 - `failed` stays one internal state, with `failure_code` alongside, so existing documents and `/retry` keep working.
 - Old `candidate` documents without the new fields still load (defaults).
 
+## Fifth audit — AutoAnime.zip (28 Oct 2026, branch `feature/autoanime-integration`)
+
+All 49 files were reviewed. The file-by-file map (adapted / not adopted, with reasons) is in
+[AUTOANIME_INTEGRATION.md](AUTOANIME_INTEGRATION.md). In short:
+- adapted: bans, extra admins, auto-delete, ping/restart, stats, mapped channels, `/manage`, `/ongoing`,
+  library `/search`, command menu, start pictures, and authorized HLS (new `anime_soul/hls.py`);
+- not adopted: the site scrapers, proxy/Tor, the N_m3u8DL-RE binary, and the zip's config and Procfile.
+
+No new dependencies. `Procfile`, `app.json` and `requirements.txt` are unchanged. One new optional env var:
+`START_PICS`.
+
 ## Fourth audit — AutoAnimeBot upload engine integration (28 Oct 2026, branch `feature/telegram-channel-source`)
 
 Reference: kaif-00z/AutoAnimeBot @47caf18 (GPL-3.0, Telethon). Read: `bot.py`, `core/bot.py`, `core/executors.py`,

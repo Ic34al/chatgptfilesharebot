@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 import sys
 
@@ -113,6 +114,7 @@ async def run(role_override: str | None = None) -> None:
     ctx = Ctx(cfg=cfg, db=db, filedb=filedb, notifier=notifier, fsub=fsub, sources=sources, anilist=anilist)
 
     stop = asyncio.Event()
+    ctx.stop_event = stop
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError):
@@ -125,10 +127,12 @@ async def run(role_override: str | None = None) -> None:
         pipeline = Pipeline(cfg, db, client, notifier, sources)
         ctx.pipeline = pipeline
     if cfg.role in ("all", "bot"):
-        from .handlers import admin, source_ingest, user
+        from .handlers import admin, extras, source_ingest, user
         admin.register(client, ctx)   # admin first so /attach captions aren't treated as share uploads
+        extras.register(client, ctx)  # bans, /manage, /autodel, /search, /ongoing … (AutoAnime.zip features)
         user.register(client, ctx)
         source_ingest.register(client, ctx)   # provider channels (separate handler group)
+        await extras.load_admins(ctx)
 
     await client.start()
     me = await client.get_me()
@@ -137,6 +141,11 @@ async def run(role_override: str | None = None) -> None:
         await preflight(client, cfg, notifier, sources)
         tasks.append(asyncio.create_task(ctx.monitor.run(stop), name="monitor"))
         tasks.append(asyncio.create_task(pipeline.run(stop), name="pipeline"))
+    if cfg.role in ("all", "bot"):
+        from .handlers import extras
+        tasks.append(asyncio.create_task(extras.autodelete_loop(ctx, client, stop), name="autodelete"))
+        await extras.set_bot_commands(ctx, client)
+        await extras.announce_restart(ctx, client)
 
     await stop.wait()
     log.info("Shutdown requested; stopping gracefully")
@@ -155,3 +164,6 @@ async def run(role_override: str | None = None) -> None:
     await sources.close()
     mongo.close()
     log.info("Stopped cleanly")
+    if ctx.restart_requested:   # /restart: re-run the same command in this dyno (leases already released)
+        log.info("Restarting (requested with /restart)")
+        os.execv(sys.executable, [sys.executable] + sys.argv)

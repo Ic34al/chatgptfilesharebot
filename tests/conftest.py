@@ -166,6 +166,21 @@ class FakeClient:
     async def create_chat_invite_link(self, chat, **kw):
         return SimpleNamespace(invite_link="https://t.me/+invite123")
 
+    async def delete_messages(self, chat_id, message_ids):
+        self.calls.append(("delete_messages", chat_id, message_ids))
+        self._maybe_fail("delete_messages")
+        return True
+
+    async def edit_message_text(self, chat_id, message_id, text, **kw):
+        self.calls.append(("edit_message_text", chat_id, message_id, text, kw))
+        self._maybe_fail("edit_message_text")
+        return SimpleNamespace(id=message_id)
+
+    async def set_bot_commands(self, commands, scope=None, **kw):
+        self.calls.append(("set_bot_commands", commands, scope))
+        self._maybe_fail("set_bot_commands")
+        return True
+
     def sent(self, name):
         return [c for c in self.calls if c[0] == name]
 
@@ -204,7 +219,11 @@ class FakeMessage:
 
     async def reply_text(self, text, **kw):
         self.replies.append((text, kw))
-        return SimpleNamespace(edit_text=self._edit)
+        return SimpleNamespace(edit_text=self._edit, id=500 + len(self.replies), chat=self.chat)
+
+    async def reply_photo(self, photo, **kw):
+        self.replies.append((("photo", photo), kw))
+        return SimpleNamespace(id=500 + len(self.replies), chat=self.chat)
 
     async def _edit(self, text, **kw):
         self.replies.append((text, kw))
