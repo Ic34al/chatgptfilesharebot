@@ -12,13 +12,17 @@ New features:
 - **Validated uploads** to a private storage channel (size, container signature, checksum, FFprobe).
 - **Channel posts** with thumbnail, HTML caption templates and a **GET EPISODE** button that opens the bot's delivery flow.
 - **Force-subscribe (FSUB)** on one or more channels, optional join-request mode, TRY AGAIN button.
-- **Admin controls**: `/status /queue /help /anime /addanime /removeanime /setanime /pending /retry /pause /resume /broadcast /captions /sources /testupload /attach /setthumb /dryrun /stats /adminhelp`.
+- **Admin controls**: `/status /queue /help /anime /addanime /removeanime /setanime /pending /retry /pause /resume /broadcast /captions /sources /testupload /attach /setthumb /dryrun /stats /adminhelp /events /checkfiles /reupload /schedule`.
+- **Ongoing-release system** ([docs/RELEASE_SYSTEM.md](docs/RELEASE_SYSTEM.md)): one adapter interface for every source (`health/find/download/validate`), release history in `episode_releases`, feed retries with exponential backoff, catch-up after downtime, batch/v2/language parsing, `telegram_uploads` and `pipeline_events` records, typed failure codes, recovery for deleted storage messages, optional daily IST schedule post.
 - **Safe 24/7 operation**: MongoDB leases (no duplicate uploads or posts), single-monitor lock, bounded retries with back-off, delay alerts, FloodWait handling, restart recovery, graceful shutdown, dry-run mode (default on) and `/testupload full`.
 
-Pipeline: `detected → queued → downloading → processing → uploading → published` (or `failed`, retry with `/retry`).
+Pipeline: `DETECTED → QUEUED → DOWNLOADING → VALIDATING → PROCESSING → UPLOADING → PUBLISHED`.
+Failures: `SOURCE_NOT_CONFIGURED, DOWNLOAD_FAILED, VALIDATION_FAILED, PROCESSING_FAILED, UPLOAD_FAILED, PUBLISH_FAILED` (retry with `/retry`).
 
 ## Docs
-- [docs/AUDIT.md](docs/AUDIT.md) — what was in the repository and what was wrong
+- [docs/AUDIT.md](docs/AUDIT.md) — what was in the repository, what was wrong, and the file-by-file plans
+- [docs/RELEASE_SYSTEM.md](docs/RELEASE_SYSTEM.md) — sources, lifecycle, collections, monitoring, delivery
+- [CREDITS.md](CREDITS.md) — attribution (AutoAnimeBot design reference, GPL-3.0) and licences
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — Telegram, MongoDB Atlas, GitHub and Heroku steps from an iPhone, troubleshooting, costs and limits
 - [docs/TESTING.md](docs/TESTING.md) — automated test report and live demonstration checklist
 - [.env.example](.env.example) — every setting, with placeholders only
@@ -30,7 +34,8 @@ bot.py, database.py, helper_func.py   original modules (kept, compatible)
 anime_soul/
   config.py          settings from environment variables
   schedule/          AniList + Jikan clients
-  monitor.py         schedule + feed release detection, delay alerts, sequels, leader lock
+  monitor.py         schedule + feed release detection, release history, downtime catch-up, alerts, leader lock
+  schedule_post.py   optional daily IST airing timetable
   sources/           authorized source adapters (inbox, local dir, JSON feed, RSS/Atom feed)
   processing.py      FFprobe validation, FFmpeg remux/transcode
   netsafe.py         download allow-list, SSRF protection
@@ -41,7 +46,7 @@ anime_soul/
   fsub.py, delivery.py, deeplink.py, captions.py
   handlers/          user and admin commands
   runner.py          startup, roles, graceful shutdown
-tests/               148 tests (Telegram/feeds mocked; real FFmpeg; optional real MongoDB)
+tests/               195 tests (Telegram/feeds mocked; real FFmpeg; optional real MongoDB)
 ```
 
 ## Local run

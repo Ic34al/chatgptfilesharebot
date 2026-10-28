@@ -1,5 +1,43 @@
 # Testing report and live demonstration checklist
 
+## Update — ongoing-release system (28 Oct 2026, branch `feature/ongoing-release-system`)
+
+| Run | Result |
+|---|---|
+| `python -m pytest` (Python 3.11.17, mongomock, real ffmpeg/ffprobe) | **191 passed**, 4 skipped (real-MongoDB file) |
+| Same suite against real MongoDB 7.0.2 (disposable local server) | **195 passed** |
+| `pyflakes anime_soul tests` | clean |
+
+New `tests/test_release_system.py` (31, providers and Telegram mocked, synthetic FFmpeg clips):
+- **Parsing:** titles, episodes and batches, including numbered titles. Group, v2, CRC and language tags. RSS GUID release IDs.
+- **Sources:** v2 preferred and batches skipped. Structured `metadata()` fields, and a round-trip with old documents.
+- **Invalid URLs:** `file://` and hosts not on the allow-list are rejected.
+- **Validation:** checksum and size mismatch raise `InvalidFile`.
+- **Retries and backoff:** temporary errors are retried, then exponential backoff is saved and survives a restart. Recovery resets the counter. Permanent errors are not retried. Network exceptions become `SourceUnavailable`.
+- **Release history:** duplicates removed across polls. Catch-up after 5 days offline without backfilling older releases. Bounds of the catch-up window. Feed-gap and repeated-failure alerts.
+- **Lifecycle:** DOWNLOADING → VALIDATING → PROCESSING → UPLOADING → PUBLISHED, with `telegram_uploads` (chat/message ID, anime, episode, quality, sha256) and `pipeline_events` written. A checksum mismatch → `VALIDATION_FAILED`, nothing uploaded.
+- **Failure codes:** a Telegram upload error → `UPLOAD_FAILED`, an alert and `/status` counts; never posted. A missing source → `SOURCE_NOT_CONFIGURED` with an alert. Mapping to public state names.
+- **Recovery:** a saved upload record prevents a duplicate upload after a crash. A restart during VALIDATING re-downloads.
+- **Delivery:** a deleted storage message → user reply, admin alert without the token, `/checkfiles` finds it, and `/reupload` keeps the same token and post (no new announcement) so the old link works again. Invalid deep links are handled. `/events` works.
+- **Schedule post:** posted once per IST day, not before the configured time, admins only in dry run, off by default.
+
+New `tests/test_heroku_config.py` (16):
+- **Procfile:** process types and commands.
+- **`app.json`:** buildpacks (Python + FFmpeg), formation, required secrets without defaults, `DRY_RUN` default `true`, and every variable is read by the code.
+- **`.env.example`:** consistent with the code and holds placeholders only.
+- **No credentials committed:** checked in the docs and config files.
+- **Python and requirements:** `.python-version` 3.11, no `runtime.txt`, pinned requirements, no test packages in the runtime list.
+- **Config loading:** loads with the minimum Config Vars. Bad values fail fast, and missing required variables are reported.
+
+**Not tested here:**
+- Heroku itself (no access from this environment).
+- Your live bot, channels and FSUB.
+- A real partner feed, because no authorized video provider is configured. A real feed and video server need a
+  permitted provider and a test file you own; follow the live checklist below with `DRY_RUN=true` first.
+- Telegram's real behaviour for deleted storage messages (simulated with `MessageIdInvalid`).
+
+---
+
 ## Update — automatic airing-anime discovery (27 Oct 2026)
 
 | Run | Result |

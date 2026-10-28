@@ -10,7 +10,8 @@ from pyrogram.handlers import CallbackQueryHandler, ChatJoinRequestHandler, Chat
 from .. import models as M
 from ..deeplink import build_link, parse_start_payload
 from ..delivery import deliver_episode
-from ..tg import call_with_flood
+from ..tg import call_with_flood, esc
+from ..timeutil import utcnow
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +54,27 @@ async def send_resolved(ctx, client, chat_id: int, kind: str, doc: dict):
                                  protect_content=doc.get("protect", False))
 
 
+async def report_delivery_failure(ctx, kind: str, doc: dict, err: Exception) -> None:
+    """Stored file could not be sent (deleted storage message, inaccessible file…): record + alert admins.
+    Never includes tokens or file_ids in the alert."""
+    if kind != "episode":
+        return
+    key = doc.get("_id")
+    text = f"{type(err).__name__}: {err}"[:300]
+    try:
+        await ctx.db.episodes.update_one({"_id": key}, {"$set": {"delivery_error": {"at": utcnow(), "error": text}}})
+        await ctx.db.mark_upload_status(key, "delivery_failed", text)
+        await ctx.db.event(key, "delivery_failed", error=text)
+    except Exception:  # never hide the user-facing reply behind a DB error
+        log.debug("could not record delivery failure", exc_info=True)
+    notifier = getattr(ctx, "notifier", None)
+    if notifier is not None:
+        await notifier.alert(
+            f"📦 Could not deliver <code>{esc(key)}</code> to a user: {esc(text)}\n"
+            f"The storage message may have been deleted. Check with /checkfiles, then /reupload {esc(key)}.",
+            key=f"delivery:{key}")
+
+
 async def start_handler(ctx, client, message):
     user_id = message.from_user.id if message.from_user else None
     if user_id:
@@ -81,6 +103,7 @@ async def start_handler(ctx, client, message):
         await message.reply_text("⏳ Telegram is rate-limiting me. Please try again in a minute.")
     except (RPCError, ValueError) as e:
         log.warning("Delivery failed for token %s…: %s", token[:6], e)
+        await report_delivery_failure(ctx, kind, doc, e)
         await message.reply_text("⚠️ Sorry, I couldn't send this file right now. Please try again later.")
 
 
@@ -106,8 +129,11 @@ async def try_again_handler(ctx, client, query):
         pass
     try:
         await send_resolved(ctx, client, query.from_user.id, kind, doc)
+    except FloodWait:
+        await client.send_message(query.from_user.id, "⏳ Telegram is rate-limiting me. Please try again in a minute.")
     except (RPCError, ValueError) as e:
         log.warning("Delivery after TRY AGAIN failed: %s", e)
+        await report_delivery_failure(ctx, kind, doc, e)
         await client.send_message(query.from_user.id, "⚠️ Sorry, I couldn't send this file right now.")
 
 

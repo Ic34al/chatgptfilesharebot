@@ -91,6 +91,8 @@ class Config:
     source_check_interval_seconds: int = 300
     lookahead_hours: int = 48
     lookback_hours: int = 72
+    reconcile_max_hours: int = 168        # catch-up window after downtime (AniList + feeds)
+    feed_alert_after_failures: int = 5    # admin alert after N consecutive feed failures
     delay_alert_minutes: int = 180
     source_giveup_hours: int = 168
     max_retries: int = 8
@@ -136,6 +138,9 @@ class Config:
     feed_detect_releases: bool = True
     dry_run_process: bool = False       # dry run also downloads + validates + processes (never uploads)
     test_channel_id: Optional[ChatRef] = None
+    schedule_post_enabled: bool = False     # daily IST airing timetable post (off by default)
+    schedule_post_time: str = "00:30"       # HH:MM, Asia/Kolkata
+    schedule_channel_id: Optional[ChatRef] = None   # default: POST_CHANNEL_ID
 
     @property
     def all_admin_ids(self) -> Tuple[int, ...]:
@@ -171,6 +176,11 @@ def load_config() -> Config:
     storage = os.getenv("STORAGE_CHANNEL_ID", "").strip()
     post = os.getenv("POST_CHANNEL_ID", "").strip()
     test_chat = os.getenv("TEST_CHANNEL_ID", "").strip()
+    sched_chat = os.getenv("SCHEDULE_CHANNEL_ID", "").strip()
+    sched_time = os.getenv("SCHEDULE_POST_TIME", "00:30").strip() or "00:30"
+    import re as _re
+    if not _re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", sched_time):
+        raise ConfigError("SCHEDULE_POST_TIME must be HH:MM (24-hour, IST), e.g. 00:30")
     role = os.getenv("ROLE", "all").strip().lower() or "all"
     if role not in {"all", "bot", "pipeline"}:
         raise ConfigError("ROLE must be one of: all, bot, pipeline")
@@ -194,6 +204,8 @@ def load_config() -> Config:
         source_check_interval_seconds=max(30, _int("SOURCE_CHECK_INTERVAL_SECONDS", 300)),
         lookahead_hours=_int("LOOKAHEAD_HOURS", 48),
         lookback_hours=_int("LOOKBACK_HOURS", 72),
+        reconcile_max_hours=max(1, _int("RECONCILE_MAX_HOURS", 168)),
+        feed_alert_after_failures=max(1, _int("FEED_ALERT_AFTER_FAILURES", 5)),
         delay_alert_minutes=_int("DELAY_ALERT_MINUTES", 180),
         source_giveup_hours=_int("SOURCE_GIVEUP_HOURS", 168),
         max_retries=_int("MAX_RETRIES", 8),
@@ -240,4 +252,7 @@ def load_config() -> Config:
         feed_detect_releases=_bool("FEED_DETECT_RELEASES", True),
         dry_run_process=_bool("DRY_RUN_PROCESS", False),
         test_channel_id=_chat_ref(test_chat) if test_chat else None,
+        schedule_post_enabled=_bool("SCHEDULE_POST_ENABLED", False),
+        schedule_post_time=sched_time,
+        schedule_channel_id=_chat_ref(sched_chat) if sched_chat else None,
     )

@@ -1,6 +1,7 @@
 """Built-in authorized source adapters."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -9,7 +10,38 @@ from typing import Dict, List, Optional
 from .. import models as M
 from ..matcher import VIDEO_EXTS, matches_episode, parse_release_name
 from ..netsafe import DownloadError, UnsafeURL, fetch_bytes, fetch_json, make_session, validate_url
-from .base import SourceAdapter, SourceItem, SourceUnavailable
+from ..timeutil import utcnow
+from .base import GenericSource, SourceAdapter, SourceItem, SourceUnavailable, make_release_id
+
+# Quick in-call retries for temporary feed errors (timeouts, 5xx, 429). Longer outages are
+# handled by the per-source exponential backoff in SourceRegistry (persisted in MongoDB).
+FETCH_RETRIES = 2
+FETCH_RETRY_BASE_DELAY = 0.5
+SOURCE_BACKOFF_BASE = 60          # seconds; doubles per consecutive failure
+SOURCE_BACKOFF_MAX = 3600
+
+
+def source_backoff_seconds(fail_count: int) -> int:
+    return int(min(SOURCE_BACKOFF_BASE * (2 ** max(0, fail_count - 1)), SOURCE_BACKOFF_MAX))
+
+
+async def _fetch_with_retry(fn):
+    """Run fn() and retry temporary failures with exponential backoff. Raises SourceUnavailable."""
+    import aiohttp
+    delay = FETCH_RETRY_BASE_DELAY
+    for attempt in range(FETCH_RETRIES + 1):
+        try:
+            return await fn()
+        except DownloadError as e:
+            err, transient = str(e), e.transient
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            err, transient = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__, True
+        except (UnsafeURL, ValueError) as e:
+            err, transient = str(e), False
+        if not transient or attempt == FETCH_RETRIES:
+            raise SourceUnavailable(err)
+        await asyncio.sleep(delay)
+        delay *= 2
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +60,8 @@ class TelegramInboxSource(SourceAdapter):
             return None
         return SourceItem(self.name, "telegram", doc["file_id"], doc.get("file_name") or "episode",
                           size=doc.get("file_size"), quality=doc.get("quality"), language=doc.get("language"),
+                          anime_id=int(anime["_id"]), episode=int(episode),
+                          release_id=make_release_id(self.name, doc.get("file_unique_id") or doc["file_id"]),
                           extra={"media_type": doc.get("media_type"), "chat_id": doc.get("chat_id"),
                                  "message_id": doc.get("message_id"), "file_unique_id": doc.get("file_unique_id")})
 
@@ -63,12 +97,17 @@ class LocalDirSource(SourceAdapter):
             if not real.startswith(self.path + os.sep):
                 continue  # symlink escaping the directory
             p = parse_release_name(os.path.basename(real))
+            if p.is_batch:
+                continue
             if matches_episode(anime, episode, title=p.title, ep=p.episode, quality=p.quality, season=p.season):
                 # Skip files still being written (modified in the last 60 s).
                 if time.time() - os.path.getmtime(real) < 60:
                     continue
+                st = os.stat(real)
                 return SourceItem(self.name, "local", real, os.path.basename(real),
-                                  size=os.path.getsize(real), quality=p.quality, owned=False)
+                                  size=st.st_size, quality=p.quality, language=p.language, owned=False,
+                                  anime_id=int(anime["_id"]), episode=int(episode), version=p.version,
+                                  release_id=make_release_id(self.name, real, st.st_size, int(st.st_mtime)))
         return None
 
     async def health(self):
@@ -110,10 +149,9 @@ class HttpFeedSource(SourceAdapter):
     async def items(self) -> list:
         if self._cache and time.monotonic() - self._cache[0] < 60:
             return self._cache[1]
-        try:
-            data = await fetch_json(await self.session(), self.url, self.allowlist, self.allow_http, self.headers())
-        except (DownloadError, UnsafeURL, ValueError) as e:
-            raise SourceUnavailable(str(e))
+        session = await self.session()
+        data = await _fetch_with_retry(
+            lambda: fetch_json(session, self.url, self.allowlist, self.allow_http, self.headers()))
         items = data.get("items") if isinstance(data, dict) else data
         if not isinstance(items, list):
             raise SourceUnavailable("Feed has no 'items' list")
@@ -121,8 +159,10 @@ class HttpFeedSource(SourceAdapter):
         return items
 
     async def find(self, anime, episode):
+        """Best matching item: highest re-release version (v2 beats v1), then feed order."""
+        best = None
         for it in await self.items():
-            if not isinstance(it, dict) or not it.get("url"):
+            if not isinstance(it, dict) or not it.get("url") or it.get("is_batch"):
                 continue
             try:
                 ok = matches_episode(anime, episode, title=it.get("title"), anime_id=it.get("anilist_id"),
@@ -138,9 +178,14 @@ class HttpFeedSource(SourceAdapter):
                 log.warning("Feed %s item rejected: %s", self.name, e)
                 continue
             name = it.get("file_name") or it["url"].rsplit("/", 1)[-1].split("?")[0] or f"episode{episode}.mkv"
-            return SourceItem(self.name, "url", it["url"], os.path.basename(name), size=it.get("size"),
-                              sha256=it.get("sha256"), quality=it.get("quality"), language=it.get("language"))
-        return None
+            version = _version(it)
+            if best is not None and version <= best.version:
+                continue
+            best = SourceItem(self.name, "url", it["url"], os.path.basename(name), size=_size(it.get("size")),
+                              sha256=it.get("sha256"), quality=it.get("quality"), language=it.get("language"),
+                              anime_id=int(anime["_id"]), episode=int(episode), version=version,
+                              release_id=release_id_of(self.name, it))
+        return best
 
     async def releases(self) -> list:
         """Items with a parsed release time, used by the monitor for feed-based release detection."""
@@ -148,7 +193,10 @@ class HttpFeedSource(SourceAdapter):
         for it in await self.items():
             if not isinstance(it, dict) or not it.get("url") or it.get("episode") is None:
                 continue
-            out.append({**it, "released_at": _parse_time(it.get("released_at"))})
+            if it.get("is_batch"):
+                continue
+            out.append({**it, "released_at": _parse_time(it.get("released_at")),
+                        "release_id": release_id_of(self.name, it), "version": _version(it)})
         return out
 
     async def health(self):
@@ -163,6 +211,25 @@ class HttpFeedSource(SourceAdapter):
 
 
 TORRENT_TYPES = ("application/x-bittorrent",)
+
+
+def release_id_of(source: str, it: dict) -> str:
+    """Feed GUID if present (stable across title edits), else the file URL."""
+    return it.get("release_id") or make_release_id(source, it.get("guid") or it.get("id") or it.get("url"))
+
+
+def _version(it: dict) -> int:
+    try:
+        return max(1, int(it.get("version") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _size(v):
+    try:
+        return int(v) if v not in (None, "") and int(v) > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _local(tag: str) -> str:
@@ -221,12 +288,16 @@ def parse_rss(body: bytes) -> list:
         p = parse_release_name(title)
         ep = fields.get("episode") or fields.get("episodenumber") or p.episode
         item = {
+            "guid": fields.get("guid") or fields.get("id"),
+            "version": p.version,
+            "is_batch": p.is_batch,
+            "group": p.group,
             "title": p.title or title,
             "raw_title": title,
             "episode": int(ep) if str(ep or "").isdigit() else None,
             "season": int(fields["season"]) if str(fields.get("season", "")).isdigit() else p.season,
             "quality": fields.get("quality") or p.quality,
-            "language": fields.get("language"),
+            "language": fields.get("language") or p.language,
             "anilist_id": int(fields["anilist_id"]) if str(fields.get("anilist_id", "")).isdigit() else None,
             "url": url,
             "size": int(size) if str(size or "").isdigit() and int(size) > 0 else None,
@@ -251,10 +322,9 @@ class RssFeedSource(HttpFeedSource):
     async def items(self) -> list:
         if self._cache and time.monotonic() - self._cache[0] < 60:
             return self._cache[1]
-        try:
-            body = await fetch_bytes(await self.session(), self.url, self.allowlist, self.allow_http, self.headers())
-        except (DownloadError, UnsafeURL, ValueError) as e:
-            raise SourceUnavailable(str(e))
+        session = await self.session()
+        body = await _fetch_with_retry(
+            lambda: fetch_bytes(session, self.url, self.allowlist, self.allow_http, self.headers()))
         items = parse_rss(body)
         self._cache = (time.monotonic(), items)
         return items
@@ -281,11 +351,13 @@ class SourceRegistry:
         self.inbox = TelegramInboxSource(db)
         self._adapters: Dict[str, SourceAdapter] = {}
         self._loaded_at = 0.0
+        self._retry_at: Dict[str, object] = {}     # source name -> datetime (backoff until)
 
-    async def adapters(self) -> List[SourceAdapter]:
-        if time.monotonic() - self._loaded_at > 60:
+    async def adapters(self, force: bool = False) -> List[SourceAdapter]:
+        if force or time.monotonic() - self._loaded_at > 60:
             docs = await self.db.list_sources(enabled_only=True)
             fresh: Dict[str, SourceAdapter] = {}
+            self._retry_at = {d["_id"]: d.get("retry_at") for d in docs if d.get("retry_at")}
             for d in docs:
                 key = f"{d['_id']}:{d.get('updated_at')}"
                 if key in self._adapters:
@@ -314,15 +386,18 @@ class SourceRegistry:
         errors = []
         adapters = await self.adapters()
         for ad in adapters:
+            if self.in_backoff(ad.name):
+                errors.append(f"{ad.name}: backing off after repeated errors")
+                continue
             try:
                 item = await ad.find(anime, episode)
                 if ad is not self.inbox:
-                    await self.db.source_status(ad.name, True)
+                    await self.mark_ok(ad.name)
                 if item:
                     return item, None
             except SourceUnavailable as e:
                 errors.append(f"{ad.name}: {e}")
-                await self.db.source_status(ad.name, False, str(e))
+                await self.mark_failed(ad.name, str(e))
         if errors:
             log.info("Sources unavailable for %s ep %s: %s", anime["_id"], episode, "; ".join(errors))
             return None, M.SOURCE_ERROR
@@ -334,10 +409,41 @@ class SourceRegistry:
         return [a for a in await self.adapters() if hasattr(a, "releases")]
 
     def adapter_by_name(self, name: str) -> Optional[SourceAdapter]:
+        if name == self.inbox.name:
+            return self.inbox
         for ad in self._adapters.values():
             if ad.name == name:
                 return ad
         return None
+
+    def adapter_for(self, item: SourceItem) -> SourceAdapter:
+        """Adapter that downloads/validates an item (generic fallback if the source was removed)."""
+        return self.adapter_by_name(item.source) or GenericSource(item.source, {})
+
+    # ------------------------------------------------------------ health/backoff
+    def in_backoff(self, name: str) -> bool:
+        until = self._retry_at.get(name)
+        if not until:
+            return False
+        if getattr(until, "tzinfo", None) is None:
+            from datetime import timezone
+            until = until.replace(tzinfo=timezone.utc)
+        return until > utcnow()
+
+    async def mark_ok(self, name: str) -> None:
+        self._retry_at.pop(name, None)
+        await self.db.source_status(name, True)
+
+    async def mark_failed(self, name: str, error: str) -> int:
+        """Record a failure and start exponential backoff. Returns the consecutive failure count."""
+        if name == self.inbox.name:
+            return 0
+        fails = await self.db.source_status(name, False, error)
+        from datetime import timedelta
+        until = utcnow() + timedelta(seconds=source_backoff_seconds(fails))
+        self._retry_at[name] = until
+        await self.db.sources.update_one({"_id": name}, {"$set": {"retry_at": until}})
+        return fails
 
     async def close(self):
         for ad in self._adapters.values():

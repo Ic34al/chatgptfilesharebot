@@ -17,12 +17,32 @@ _PATTERNS = [
 ]
 
 
+_GROUP = re.compile(r"^\s*\[(?P<g>[^\]]{1,40})\]")
+_CRC = re.compile(r"\[(?P<crc>[0-9A-Fa-f]{8})\]")
+_VERSION = re.compile(r"(?:E|\s|-)\d{1,4}v(?P<v>\d)\b", re.I)
+_BATCH = re.compile(r"(?i)\bbatch\b|\bcomplete\b|[\(\[]\s*\d{1,4}\s*[-~]\s*\d{1,4}\s*[\)\]]"
+                    r"|(?<!\d)\d{1,4}\s*~\s*\d{1,4}(?!\d)|\bEp(?:isodes?)?\.?\s*\d{1,4}\s*-\s*\d{1,4}\b"
+                    r"|\bS\d{1,2}E\d{1,4}\s*-\s*E?\d{1,4}\b")
+_LANG_TAGS = (
+    (re.compile(r"(?i)\bdual[\s._-]?audio\b"), "Dual Audio"),
+    (re.compile(r"(?i)\bmulti[\s._-]?(?:audio|sub)s?\b"), "Multi"),
+    (re.compile(r"(?i)\bhindi\b"), "Hindi"),
+    (re.compile(r"(?i)\b(?:eng(?:lish)?[\s._-]?dub(?:bed)?|dub(?:bed)?)\b"), "English Dub"),
+    (re.compile(r"(?i)\b(?:e[\s._-]?subs?|eng(?:lish)?[\s._-]?subs?|subbed)\b"), "English Sub"),
+)
+
+
 @dataclass
 class ParsedRelease:
     title: str
     episode: Optional[int]
     season: Optional[int]
     quality: Optional[str]
+    group: Optional[str] = None        # release group, e.g. "[Studio]"
+    version: int = 1                   # v2 / v3 re-releases
+    crc32: Optional[str] = None        # [ABCD1234] checksum tag in the name (informational only)
+    language: Optional[str] = None     # tag found in the name (Dual Audio, English Sub…)
+    is_batch: bool = False             # "01-12", "[Batch]", "Complete" → never treated as one episode
 
 
 def normalize_title(text: str) -> str:
@@ -40,14 +60,22 @@ def parse_release_name(name: str) -> ParsedRelease:
             break
     q = _QUAL.search(base)
     quality = f"{q.group(1)}p" if q else None
+    g = _GROUP.match(base)
+    crc = _CRC.search(base)
+    v = _VERSION.search(base)
+    lang = next((label for rx, label in _LANG_TAGS if rx.search(base)), None)
+    meta = dict(group=g.group("g").strip() if g else None, version=int(v.group("v")) if v else 1,
+                crc32=crc.group("crc").upper() if crc else None, language=lang,
+                is_batch=bool(_BATCH.search(_CRC.sub(" ", base))))
     cleaned = _BRACKETS.sub(" ", base).replace("_", " ").strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
     for pat in _PATTERNS:
         m = pat.search(cleaned)
         if m:
             season = int(m.group("season")) if "season" in m.groupdict() and m.group("season") else None
-            return ParsedRelease(m.group("title").strip(" -._"), int(m.group("ep")), season, quality)
-    return ParsedRelease(cleaned, None, None, quality)
+            ep = None if meta["is_batch"] else int(m.group("ep"))
+            return ParsedRelease(m.group("title").strip(" -._"), ep, season, quality, **meta)
+    return ParsedRelease(cleaned, None, None, quality, **meta)
 
 
 def title_matches(candidate: str, names: Iterable[str], threshold: float = 0.88) -> bool:

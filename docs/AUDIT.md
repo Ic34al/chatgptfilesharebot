@@ -87,3 +87,49 @@ commands · dry run · ROLE=all/bot/pipeline · graceful shutdown.
 | Post lacked synopsis/status; quality came from the feed label | AniList synopsis (only when present), release status, FFprobe-verified quality |
 | Bad numeric config gave a bare `ValueError` | `ConfigError` naming the variable (never its value) |
 | Admin alerts/errors could echo secrets in exception text | Redaction applied to alerts and command errors |
+
+## Third audit — ongoing-release system (28 Oct 2026, branch `feature/ongoing-release-system`)
+
+Inspected `main` at `1affaf4` (144 passed / 148 with real MongoDB) and the reference
+[kaif-00z/AutoAnimeBot](https://github.com/kaif-00z/AutoAnimeBot) (GPL-3.0): `libs/subsplease.py`
+(RSS polling), `functions/schedule.py` (daily IST timetable), `functions/info.py` (AniList), `database/`
+(uploaded-hash check), `core/executors.py` (download → encode → upload → post), `libs/ariawarp.py`
+(aria2 torrents), `Dockerfile` (static FFmpeg).
+
+**Licence decision:** AutoAnimeBot is GPL-3.0. Copying any of its code would make this repository a
+GPL-3.0 derivative. Only design patterns were reused, reimplemented from scratch. Attribution is in
+[CREDITS.md](../CREDITS.md) and [RELEASE_SYSTEM.md](RELEASE_SYSTEM.md).
+**Not adopted:** SubsPlease/Nyaa sources, magnet/torrent downloads (aria2), and the `?start=<message id>` link format
+(the existing opaque tokens are kept so old links work). The reference has no authorization model for these sources.
+
+### Compatible modules → where they went
+| AutoAnimeBot | ANIME SOUL (existing architecture) |
+|---|---|
+| `SubsPlease.feed_optimizer` + `is_anime_uploaded(sha256(title))` | `RssFeedSource`/`HttpFeedSource` + `episode_releases` (GUID/URL hash) |
+| anitopy parsing, `[Batch]` skip | `matcher.parse_release_name` (group, v2, CRC, language, batch) |
+| `functions/schedule.py` (APScheduler 00:30 IST) | `schedule_post.py` called by the monitor (no new dependency) |
+| `core/executors.py` stages | existing `pipeline.py` state machine + new VALIDATING stage |
+| Dockerfile static FFmpeg | existing Heroku FFmpeg buildpack |
+
+### File-by-file plan (as implemented)
+| File | Change |
+|---|---|
+| `anime_soul/matcher.py` | Release group, version, CRC tag, language tags, batch detection (numbered titles like *Kaiju No. 8 - 12* and *86 - 05* still parse) |
+| `anime_soul/sources/base.py` | Adapter interface `health/find/download/validate`. `SourceItem` gains `anime_id, episode, release_id, version` plus `metadata()`. `TransferContext`, `GenericSource` |
+| `anime_soul/sources/adapters.py` | Items carry structured metadata; v2 preferred; batches skipped; network errors handled; quick retries; persisted per-source exponential backoff (`retry_at`, `fail_count`, `last_success_at`) |
+| `anime_soul/db.py` | New `episode_releases`, `telegram_uploads`, `pipeline_events` (+ indexes, TTL). `source_status` returns the failure count. `record_release / match_release / record_upload / get_upload / prepare_reupload / count_failure_codes / ping / event` |
+| `anime_soul/models.py` | `VALIDATING` state, failure codes, `public_state()` mapping to the brief's names |
+| `anime_soul/pipeline.py` | Download via `adapter.download()`, new VALIDATING step via `adapter.validate()` + sha256. Failure codes set on every error. Confirmed uploads recorded first and reused after a crash. Existing post kept on re-upload |
+| `anime_soul/monitor.py` | Downtime reconciliation (AniList + feeds), release history dedupe, feed gap alert, persistent-failure alert, daily schedule hook |
+| `anime_soul/schedule_post.py` (new) | Daily IST timetable, posted once per day by a MongoDB claim; in dry run it goes to admins only |
+| `anime_soul/handlers/user.py` | Delivery failure → recorded and admin alert (no tokens/file IDs). TRY AGAIN handles FloodWait |
+| `anime_soul/handlers/admin.py` | `/status` adds MongoDB ping, disk, public states, failure codes and feed health. New `/events`, `/checkfiles`, `/reupload`, `/schedule`. `/queue` shows failure codes |
+| `anime_soul/runner.py` | MongoDB ping at start-up with a clear error (no URI in logs) |
+| `anime_soul/config.py` | `RECONCILE_MAX_HOURS`, `FEED_ALERT_AFTER_FAILURES`, `SCHEDULE_POST_ENABLED/TIME`, `SCHEDULE_CHANNEL_ID` |
+| `app.json`, `.env.example` | New optional variables (safe defaults). Nothing existing changed |
+| `tests/test_release_system.py`, `tests/test_heroku_config.py` (new) | 47 tests |
+
+**Dependencies:** none added. **Conflicts considered:**
+- Collection names in the brief differ from production. The production collections are kept and the mapping is documented.
+- `failed` stays one internal state, with `failure_code` alongside, so existing documents and `/retry` keep working.
+- Old `candidate` documents without the new fields still load (defaults).

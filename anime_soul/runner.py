@@ -97,6 +97,12 @@ async def run(role_override: str | None = None) -> None:
     filedb = FileDB(cfg.mongodb_uri, cfg.database_name)
     await filedb.connect(mongo)
     db = AnimeDB(mongo[cfg.database_name])
+    try:
+        log.info("MongoDB reachable (%.0f ms)", await db.ping())
+    except Exception as e:  # never log the URI (it contains the password)
+        log.error("Cannot reach MongoDB (%s). Check MONGODB_URI and MongoDB Atlas → Network Access "
+                  "(Heroku needs 0.0.0.0/0).", type(e).__name__)
+        sys.exit(3)
     await db.ensure_indexes()
 
     client = build_client(cfg, cfg.role)

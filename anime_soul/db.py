@@ -37,6 +37,12 @@ class AnimeDB:
         self.fsub_requests = database["fsub_requests"]
         self.inbox = database["inbox"]
         self.files = database["files"]  # legacy collection shared with database.FileDB
+        # Release history / upload records / audit log. The brief's names map to existing collections:
+        #   anime_schedule -> "anime" + "episodes" (airing_at), episode_jobs -> "episodes",
+        #   authorized_sources -> "sources". They are not renamed so production data stays valid.
+        self.releases = database["episode_releases"]
+        self.uploads = database["telegram_uploads"]
+        self.events = database["pipeline_events"]
 
     # ------------------------------------------------------------------ setup
     async def ensure_indexes(self) -> None:
@@ -49,6 +55,12 @@ class AnimeDB:
         await self.fsub_requests.create_index([("user_id", ASCENDING), ("chat_id", ASCENDING)], unique=True)
         await self.fsub_requests.create_index("at", expireAfterSeconds=30 * 24 * 3600)
         await self.files.create_index("unique_id")
+        await self.releases.create_index([("source", ASCENDING), ("first_seen", ASCENDING)])
+        await self.releases.create_index("matched_key", sparse=True)
+        await self.uploads.create_index("episode_key", unique=True)
+        await self.uploads.create_index([("storage_chat_id", ASCENDING), ("message_id", ASCENDING)])
+        await self.events.create_index("at", expireAfterSeconds=60 * 24 * 3600)
+        await self.events.create_index([("episode_key", ASCENDING), ("at", ASCENDING)])
 
     # --------------------------------------------------------------- settings
     async def get_setting(self, key: str, default: Any = None) -> Any:
@@ -214,10 +226,65 @@ class AnimeDB:
             {"_id": key},
             {"$set": {"state": state, "updated_at": now, **fields},
              "$push": {"history": {"$each": [{"at": now, "event": state}], "$slice": -50}}})
+        await self.event(key, "state", state=state, failure_code=fields.get("failure_code"),
+                         error=(fields.get("last_error") or None) and str(fields["last_error"])[:300], worker=WORKER_ID)
 
     async def record_error(self, key: str, stage: str, error: str, attempt: int) -> None:
         await self.job_errors.insert_one({"episode_key": key, "stage": stage, "error": error[:2000],
                                           "attempt": attempt, "at": utcnow()})
+
+    # ----------------------------------------------------------- audit events
+    async def event(self, key: Optional[str], event: str, **data) -> None:
+        """Append to pipeline_events (best effort; never breaks the pipeline). No secrets here."""
+        try:
+            await self.events.insert_one({"episode_key": key, "event": event, "at": utcnow(),
+                                          **{k: v for k, v in data.items() if v is not None}})
+        except Exception as e:  # noqa: BLE001 - audit log must not stop a job
+            log.debug("pipeline_events write failed: %s", e)
+
+    async def recent_events(self, key: str, limit: int = 20) -> List[dict]:
+        return await self.events.find({"episode_key": key}).sort("at", -1).to_list(length=limit)
+
+    # -------------------------------------------------------- release history
+    async def record_release(self, release_id: str, source: str, rel: Dict[str, Any], released_at) -> Optional[dict]:
+        """Upsert one feed release. Returns the previous document (None if first time seen)."""
+        now = utcnow()
+        keep = {k: rel.get(k) for k in ("title", "raw_title", "episode", "season", "quality", "language",
+                                         "version", "anilist_id", "file_name", "size", "sha256", "guid")}
+        return await self.releases.find_one_and_update(
+            {"_id": release_id},
+            {"$set": {"last_seen": now, "source": source},
+             "$setOnInsert": {**keep, "first_seen": now, "released_at": released_at, "matched_key": None}},
+            upsert=True, return_document=ReturnDocument.BEFORE)
+
+    async def match_release(self, release_id: str, key: str) -> None:
+        await self.releases.update_one({"_id": release_id}, {"$set": {"matched_key": key}})
+
+    # --------------------------------------------------------- upload records
+    async def record_upload(self, key: str, storage: Dict[str, Any], **meta) -> None:
+        """One row per stored episode (unique episode_key) — prevents duplicate uploads."""
+        anime_id, ep = M.parse_episode_key(key)
+        doc = {"episode_key": key, "anime_id": anime_id, "episode": ep,
+               "storage_chat_id": storage.get("chat_id"), "message_id": storage.get("message_id"),
+               "file_id": storage.get("file_id"), "file_unique_id": storage.get("file_unique_id"),
+               "media_type": storage.get("media_type"), "file_size": storage.get("file_size"),
+               "quality": meta.get("quality"), "language": meta.get("language"), "sha256": meta.get("sha256"),
+               "source_id": meta.get("source_id"), "uploaded_at": utcnow(), "status": "stored"}
+        await self.uploads.update_one({"episode_key": key}, {"$set": doc}, upsert=True)
+
+    async def get_upload(self, key: str) -> Optional[dict]:
+        return await self.uploads.find_one({"episode_key": key})
+
+    async def mark_upload_status(self, key: str, status: str, error: Optional[str] = None) -> None:
+        await self.uploads.update_one({"episode_key": key}, {"$set": {"status": status, "status_at": utcnow(),
+                                                                       "status_error": (error or "")[:300]}})
+
+    async def ping(self) -> float:
+        """MongoDB round-trip in ms (raises on failure)."""
+        import time as _t
+        t0 = _t.monotonic()
+        await self.db.command("ping")
+        return (_t.monotonic() - t0) * 1000
 
     async def count_by_state(self) -> Dict[str, int]:
         out = {s: 0 for s in M.ALL_STATES}
@@ -261,6 +328,34 @@ class AnimeDB:
             "state": new_state, "attempts": 0, "next_attempt_at": utcnow(), "last_error": None,
             "lease_owner": None, "lease_until": None, "updated_at": utcnow()}})
         return True
+
+    async def prepare_reupload(self, key: str) -> Optional[str]:
+        """Re-acquire and re-upload a published episode whose stored file is gone.
+        The deep-link token and the channel post are kept, so existing GET EPISODE buttons keep working
+        and no second announcement is made. Returns the new state, or None if not possible."""
+        doc = await self.get_episode(key)
+        if not doc or not (doc.get("storage") or doc.get("state") == M.PUBLISHED):
+            return None
+        new_state = M.AVAILABLE if doc.get("candidate") else M.AIRING
+        await self.uploads.update_one({"episode_key": key}, {"$set": {"status": "replaced", "status_at": utcnow()}})
+        await self.uploads.delete_one({"episode_key": key, "status": "replaced"})
+        await self.episodes.update_one({"_id": key}, {"$set": {
+            "state": new_state, "storage": None, "previous_storage": doc.get("storage"), "attempts": 0,
+            "next_attempt_at": utcnow(), "last_error": None, "failure_code": None, "delivery_error": None,
+            "lease_owner": None, "lease_until": None, "local_path": None, "source_path": None,
+            "updated_at": utcnow()}})
+        await self.event(key, "reupload_requested", previous_state=doc.get("state"))
+        return new_state
+
+    async def count_failure_codes(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        q = {"$or": [{"state": M.FAILED}, {"failure_code": {"$ne": None}, "state": {"$ne": M.PUBLISHED}}]}
+        async for row in self.episodes.aggregate([{"$match": q},
+                                                  {"$group": {"_id": "$failure_code", "n": {"$sum": 1}}}]):
+            out[row["_id"] or "FAILED"] = row["n"]
+        out[M.SOURCE_NOT_CONFIGURED] = await self.episodes.count_documents(
+            {"state": M.AIRING, "source_status": M.SOURCE_NOT_CONFIGURED})
+        return {k: v for k, v in out.items() if v}
 
     # ------------------------------------------------------------------ posts
     async def claim_post(self, key: str, chat_id) -> bool:
@@ -320,9 +415,18 @@ class AnimeDB:
         res = await self.sources.delete_one({"_id": name})
         return res.deleted_count > 0
 
-    async def source_status(self, name: str, ok: bool, error: Optional[str] = None) -> None:
-        await self.sources.update_one({"_id": name}, {"$set": {"last_check": utcnow(), "last_ok": ok,
-                                                               "last_error": (error or "")[:500]}})
+    async def source_status(self, name: str, ok: bool, error: Optional[str] = None) -> int:
+        """Record a health check. Returns the number of consecutive failures (0 when ok)."""
+        now = utcnow()
+        if ok:
+            await self.sources.update_one({"_id": name}, {"$set": {
+                "last_check": now, "last_ok": True, "last_error": "", "last_success_at": now,
+                "fail_count": 0, "retry_at": None}})
+            return 0
+        doc = await self.sources.find_one_and_update(
+            {"_id": name}, {"$set": {"last_check": now, "last_ok": False, "last_error": (error or "")[:500]},
+                            "$inc": {"fail_count": 1}}, return_document=ReturnDocument.AFTER)
+        return int((doc or {}).get("fail_count") or 1)
 
     # ------------------------------------------------------------------ inbox
     async def add_inbox_file(self, key: str, data: Dict[str, Any]) -> None:
