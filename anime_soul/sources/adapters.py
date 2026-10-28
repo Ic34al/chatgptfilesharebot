@@ -330,7 +330,7 @@ class RssFeedSource(HttpFeedSource):
         return items
 
 
-def build_adapter(doc: dict, cfg) -> SourceAdapter:
+def build_adapter(doc: dict, cfg, db=None) -> SourceAdapter:
     if not doc.get("authorized") or not (doc.get("license_note") or "").strip():
         raise ValueError("Source is not marked as authorized")
     t = doc.get("type")
@@ -341,6 +341,9 @@ def build_adapter(doc: dict, cfg) -> SourceAdapter:
         return HttpFeedSource(doc["_id"], conf, cfg.allowed_source_hosts, cfg.allow_http_sources)
     if t == "rss_feed":
         return RssFeedSource(doc["_id"], conf, cfg.allowed_source_hosts, cfg.allow_http_sources)
+    if t == "telegram_channel":
+        from .telegram_channel import TelegramChannelSource
+        return TelegramChannelSource(doc["_id"], conf, db, cfg)
     raise ValueError(f"Unknown source type {t!r}")
 
 
@@ -364,7 +367,7 @@ class SourceRegistry:
                     fresh[key] = self._adapters.pop(key)
                     continue
                 try:
-                    fresh[key] = build_adapter(d, self.cfg)
+                    fresh[key] = build_adapter(d, self.cfg, self.db)
                 except ValueError as e:
                     log.warning("Source %s disabled: %s", d["_id"], e)
                     await self.db.source_status(d["_id"], False, str(e))
@@ -407,6 +410,10 @@ class SourceRegistry:
 
     async def feed_adapters(self) -> List[SourceAdapter]:
         return [a for a in await self.adapters() if hasattr(a, "releases")]
+
+    async def channel_adapters(self, force: bool = False) -> List[SourceAdapter]:
+        """Enabled Telegram provider channels (type telegram_channel)."""
+        return [a for a in await self.adapters(force) if getattr(a, "type", "") == "telegram_channel"]
 
     def adapter_by_name(self, name: str) -> Optional[SourceAdapter]:
         if name == self.inbox.name:

@@ -43,6 +43,9 @@ class AnimeDB:
         self.releases = database["episode_releases"]
         self.uploads = database["telegram_uploads"]
         self.events = database["pipeline_events"]
+        # Files posted by an authorized provider in a Telegram channel (sources/telegram_channel.py)
+        self.source_files = database["telegram_source_files"]
+        self.state_listeners: list = []      # async fn(key, state, fields); e.g. reporter.JobReporter
 
     # ------------------------------------------------------------------ setup
     async def ensure_indexes(self) -> None:
@@ -61,6 +64,9 @@ class AnimeDB:
         await self.uploads.create_index([("storage_chat_id", ASCENDING), ("message_id", ASCENDING)])
         await self.events.create_index("at", expireAfterSeconds=60 * 24 * 3600)
         await self.events.create_index([("episode_key", ASCENDING), ("at", ASCENDING)])
+        await self.source_files.create_index([("source", ASCENDING), ("file_unique_id", ASCENDING)], unique=True)
+        await self.source_files.create_index([("source", ASCENDING), ("matched_key", ASCENDING)])
+        await self.source_files.create_index([("source", ASCENDING), ("status", ASCENDING), ("message_id", ASCENDING)])
 
     # --------------------------------------------------------------- settings
     async def get_setting(self, key: str, default: Any = None) -> Any:
@@ -228,6 +234,11 @@ class AnimeDB:
              "$push": {"history": {"$each": [{"at": now, "event": state}], "$slice": -50}}})
         await self.event(key, "state", state=state, failure_code=fields.get("failure_code"),
                          error=(fields.get("last_error") or None) and str(fields["last_error"])[:300], worker=WORKER_ID)
+        for listener in self.state_listeners:
+            try:
+                await listener(key, state, fields)
+            except Exception as e:  # noqa: BLE001 - listeners are best effort
+                log.debug("state listener failed: %s", e)
 
     async def record_error(self, key: str, stage: str, error: str, attempt: int) -> None:
         await self.job_errors.insert_one({"episode_key": key, "stage": stage, "error": error[:2000],

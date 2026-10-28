@@ -33,7 +33,7 @@ HTML = enums.ParseMode.HTML
 ADMIN_COMMANDS = ["status", "queue", "anime", "addanime", "removeanime", "setanime", "pending", "retry", "pause",
                   "resume",
                   "broadcast", "captions", "sources", "testupload", "attach", "setthumb", "dryrun", "stats",
-                  "adminhelp", "checkfiles", "reupload", "events", "schedule"]
+                  "adminhelp", "checkfiles", "reupload", "events", "schedule", "unmatched", "assign"]
 
 ADMIN_HELP = """<b>ANIME SOUL admin commands</b>
 /status – monitor, worker, FFmpeg &amp; source health
@@ -52,7 +52,9 @@ ADMIN_HELP = """<b>ANIME SOUL admin commands</b>
 /attach &lt;id&gt; &lt;episode&gt; [quality] – reply to an authorized video/file
 /setthumb &lt;id&gt; – reply to a photo (or: /setthumb &lt;id&gt; none)
 /captions – list · show/set/preview/reset &lt;id|default&gt;
-/sources – list · add_rss · add_feed · add_dir · enable · disable · remove · check
+/sources – list · add_rss · add_feed · add_dir · add_tg · scan · enable · disable · remove · check
+/sources add_tg &lt;name&gt; &lt;chat_id&gt; | &lt;licence&gt; – provider Telegram channel (bot must be admin there)
+/unmatched – provider files that could not be matched · /assign &lt;chat:msg&gt; &lt;id&gt; &lt;episode&gt;
 /testupload [full] [publish [live]] – reply to a sample video you own
    full = download → FFmpeg check → upload (tests the real pipeline path)
    publish = TEST post to TEST_CHANNEL_ID (add "live" to post in the main channel)
@@ -547,6 +549,8 @@ async def cmd_sources(ctx, client, m):
         out.append("\nAdd: /sources add_rss &lt;name&gt; &lt;https RSS/Atom url&gt; | &lt;licence/permission note&gt;"
                    "\n/sources add_feed &lt;name&gt; &lt;https JSON url&gt; | &lt;licence/permission note&gt;"
                    "\n/sources add_dir &lt;name&gt; &lt;path&gt; | &lt;licence note&gt;"
+                   "\n/sources add_tg &lt;name&gt; &lt;channel id -100…&gt; | &lt;licence/permission note&gt;"
+                   "\n/sources scan &lt;name&gt; &lt;from message id&gt; – read older provider posts"
                    "\n/sources enable|disable|remove &lt;name&gt; · /sources check")
         await m.reply_text("\n".join(out)[:4000], parse_mode=HTML)
         return
@@ -569,6 +573,12 @@ async def cmd_sources(ctx, client, m):
         await ctx.db.upsert_source(name, {k: v for k, v in doc.items() if k != "_id"})
         await m.reply_text(f"✅ Source {name} added.")
         return
+    if sub == "add_tg":
+        await _add_tg_source(ctx, client, m, a, note)
+        return
+    if sub == "scan":
+        await _scan_tg_source(ctx, client, m, a)
+        return
     if sub in ("enable", "disable", "remove") and len(a) > 1:
         ok = (await ctx.db.remove_source(a[1])) if sub == "remove" else \
             (await ctx.db.set_source_enabled(a[1], sub == "enable"))
@@ -581,6 +591,105 @@ async def cmd_sources(ctx, client, m):
         await m.reply_text("\n".join(out) or "No sources.")
         return
     await m.reply_text("Unknown subcommand. Use /sources")
+
+
+async def _add_tg_source(ctx, client, m, a, note):
+    """Register a Telegram channel/group where an authorized provider uploads episode files."""
+    if len(a) < 3 or not note:
+        await m.reply_text("Usage: /sources add_tg &lt;name&gt; &lt;chat_id&gt; | &lt;licence/permission note&gt;\n"
+                           "The note must confirm the provider allows you to redistribute these files.",
+                           parse_mode=HTML)
+        return
+    name, raw = a[1], a[2].split("|")[0].strip()
+    try:
+        chat_id = int(raw)
+    except ValueError:
+        await m.reply_text("chat_id must be the numeric channel ID (e.g. -1001234567890). Forward a post "
+                           "from the channel to @username_to_id_bot or use /id inside a group to find it.")
+        return
+    doc = {"_id": name, "type": "telegram_channel", "config": {"chat_id": chat_id}, "authorized": True,
+           "license_note": note[:500], "enabled": True, "added_by": m.from_user.id}
+    try:
+        build_adapter(doc, ctx.cfg, ctx.db)
+    except ValueError as e:
+        await m.reply_text(f"❌ {e}")
+        return
+    if chat_id in {ctx.cfg.storage_channel_id, ctx.cfg.post_channel_id}:
+        await m.reply_text("❌ Use a separate intake channel, not the storage or post channel.")
+        return
+    try:
+        member = await client.get_chat_member(chat_id, "me")
+        status = getattr(getattr(member, "status", None), "value", str(getattr(member, "status", "")))
+    except RPCError as e:
+        await m.reply_text(f"❌ I can't access chat {chat_id} ({e}). Add the bot to the channel as an "
+                           "administrator first, then run this again.")
+        return
+    if status not in ("administrator", "owner"):
+        await m.reply_text(f"❌ The bot is '{status}' in {chat_id}. Telegram only sends channel posts to "
+                           "administrator bots — promote it to admin and run this again.")
+        return
+    await ctx.db.upsert_source(name, {k: v for k, v in doc.items() if k != "_id"})
+    await ctx.sources.adapters(force=True)
+    await m.reply_text(f"✅ Provider channel {name} added. New video posts there are picked up automatically.\n"
+                       f"Older posts: /sources scan {name} &lt;first message id&gt;", parse_mode=HTML)
+
+
+async def _scan_tg_source(ctx, client, m, a):
+    if len(a) < 3 or not a[2].isdigit():
+        await m.reply_text("Usage: /sources scan &lt;name&gt; &lt;from message id&gt;", parse_mode=HTML)
+        return
+    ad = next((x for x in await ctx.sources.channel_adapters(force=True) if x.name == a[1]), None)
+    if ad is None:
+        await m.reply_text("No enabled provider channel with that name.")
+        return
+    before = (await ctx.db.sources.find_one({"_id": ad.name}) or {}).get("last_message_id") or 0
+    await ctx.db.sources.update_one({"_id": ad.name}, {"$set": {"last_message_id": int(a[2]) - 1}})
+    try:
+        got = await ad.catch_up(client, ctx.notifier, max_messages=ctx.cfg.tg_source_scan_limit,
+                                max_empty_batches=3)   # tolerate gaps from deleted posts
+    finally:
+        await ctx.db.sources.update_one({"_id": ad.name}, {"$max": {"last_message_id": int(before)}})
+    await m.reply_text(f"Scanned {got['scanned']} message id(s); {got['new']} new matched file(s). "
+                       "See /unmatched for files I couldn't match.")
+
+
+async def cmd_unmatched(ctx, client, m):
+    docs = await ctx.db.source_files.find({"status": {"$in": ["unmatched", "rejected"]}}) \
+        .sort("received_at", -1).to_list(length=15)
+    if not docs:
+        await m.reply_text("No unmatched or rejected provider files.")
+        return
+    out = ["<b>Provider files needing attention</b>"]
+    for d in docs:
+        why = d.get("reject_reason") if d["status"] == "rejected" else "no tracked anime matched"
+        out.append(f"• <code>{esc(d['_id'])}</code> ({esc(d['source'])}) {esc((d.get('file_name') or '')[:60])}"
+                   f" — {esc(why)}")
+    out.append("\nFix a match: /assign &lt;chat:msg&gt; &lt;anilist id&gt; &lt;episode&gt;")
+    await m.reply_text("\n".join(out)[:4000], parse_mode=HTML)
+
+
+async def cmd_assign(ctx, client, m):
+    """Assign a provider file to an episode by hand (for names the matcher can't parse)."""
+    a = _args(m)
+    if len(a) < 3 or not a[1].isdigit() or not a[2].isdigit():
+        await m.reply_text("Usage: /assign &lt;chat:msg&gt; &lt;anilist id&gt; &lt;episode&gt;", parse_mode=HTML)
+        return
+    doc = await ctx.db.source_files.find_one({"_id": a[0]})
+    if not doc:
+        await m.reply_text("Unknown provider file. See /unmatched.")
+        return
+    if doc["status"] == "rejected":
+        await m.reply_text(f"That file was rejected ({doc.get('reject_reason')}) and won't be uploaded.")
+        return
+    if not await ctx.db.get_anime(int(a[1])):
+        await m.reply_text("That anime isn't tracked. /addanime it first.")
+        return
+    ad = next((x for x in await ctx.sources.channel_adapters() if x.name == doc["source"]), None)
+    if ad is None:
+        await m.reply_text("That provider channel is disabled or removed.")
+        return
+    key = await ad.assign(doc["_id"], int(a[1]), int(a[2]))
+    await m.reply_text(f"✅ Assigned to {key}. The pipeline will upload and publish it shortly.")
 
 
 async def cmd_testupload(ctx, client, m):
