@@ -209,6 +209,12 @@ class Pipeline:
                 await self.db.mark_upload_status(key, "published")
                 await self.db.release(key)
                 log.info("Published %s", key)
+                try:   # optional per-anime channels (/setmap); never affects the main post
+                    from .handlers.extras import post_to_mapped
+                    await post_to_mapped(self.db, self.client, self.cfg, anime, await self.db.get_episode(key),
+                                         await self.bot_username(), self.notifier)
+                except Exception:  # noqa: BLE001
+                    log.exception("Mapped-channel posting failed for %s", key)
                 return M.PUBLISHED
             await self.db.release(key)
             return state

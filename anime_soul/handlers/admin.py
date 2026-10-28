@@ -822,11 +822,22 @@ async def cmd_id(ctx, client, m):
 
 
 async def cmd_stats(ctx, client, m):
-    # Original /stats behaviour (owner) — admins allowed too.
-    await m.reply_text(f"📊 Stored files: `{await ctx.filedb.count_files()}`")
+    # Original /stats line first (owner) — admins allowed too; extra lines adapted from AutoAnime.zip.
+    from .extras import db_stats, system_stats
+    states = await ctx.db.count_by_state()
+    users = await ctx.db.users.count_documents({})
+    lines = [f"📊 Stored files: `{await ctx.filedb.count_files()}`",
+             f"👤 Users: `{users}` · 🛡 Admins: `{len(set(ctx.cfg.all_admin_ids) | set(ctx.extra_admins))}`",
+             f"🎬 Episodes published: `{states.get(M.PUBLISHED, 0)}` · failed: `{states.get(M.FAILED, 0)}`",
+             f"🗄 {await db_stats(ctx.db)}",
+             system_stats()]
+    await m.reply_text("\n".join(lines))
 
 
 COMMANDS = {name: globals()[f"cmd_{name}"] for name in ADMIN_COMMANDS}
+
+from .extras import EXTRA_HELP  # noqa: E402 - extras imports guard() from this module lazily
+ADMIN_HELP = ADMIN_HELP + EXTRA_HELP
 
 
 def guard(fn):

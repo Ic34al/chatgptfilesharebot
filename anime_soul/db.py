@@ -45,6 +45,12 @@ class AnimeDB:
         self.events = database["pipeline_events"]
         # Files posted by an authorized provider in a Telegram channel (sources/telegram_channel.py)
         self.source_files = database["telegram_source_files"]
+        # Features adapted from AutoAnime.zip (see docs/AUTOANIME_INTEGRATION.md)
+        self.banned = database["banned_users"]
+        self.bot_admins = database["bot_admins"]
+        self.autodelete = database["autodelete_queue"]
+        self.mapped_channels = database["mapped_channels"]
+        self.mapped_posts = database["mapped_posts"]
         self.state_listeners: list = []      # async fn(key, state, fields); e.g. reporter.JobReporter
 
     # ------------------------------------------------------------------ setup
@@ -65,6 +71,8 @@ class AnimeDB:
         await self.events.create_index("at", expireAfterSeconds=60 * 24 * 3600)
         await self.events.create_index([("episode_key", ASCENDING), ("at", ASCENDING)])
         await self.source_files.create_index([("source", ASCENDING), ("file_unique_id", ASCENDING)], unique=True)
+        await self.autodelete.create_index([("delete_at", ASCENDING)])
+        await self.mapped_channels.create_index([("anime_ids", ASCENDING)])
         await self.source_files.create_index([("source", ASCENDING), ("matched_key", ASCENDING)])
         await self.source_files.create_index([("source", ASCENDING), ("status", ASCENDING), ("message_id", ASCENDING)])
 
@@ -469,6 +477,91 @@ class AnimeDB:
 
     async def clear_join_request(self, user_id: int, chat_id: int) -> None:
         await self.fsub_requests.delete_one({"user_id": int(user_id), "chat_id": int(chat_id)})
+
+    # ------------------------------------------------------- bans (AutoAnime)
+    async def ban_user(self, user_id: int, reason: str, by: int) -> None:
+        await self.banned.update_one({"_id": int(user_id)}, {"$set": {"reason": reason[:300], "by": int(by),
+                                                                     "at": utcnow()}}, upsert=True)
+
+    async def unban_user(self, user_id: int) -> bool:
+        return (await self.banned.delete_one({"_id": int(user_id)})).deleted_count > 0
+
+    async def get_ban(self, user_id: int) -> Optional[dict]:
+        return await self.banned.find_one({"_id": int(user_id)})
+
+    async def list_bans(self, limit: int = 50) -> List[dict]:
+        return await self.banned.find({}).sort("at", -1).to_list(length=limit)
+
+    # ------------------------------------------ extra bot admins (AutoAnime)
+    async def add_bot_admin(self, user_id: int, by: int, name: Optional[str] = None) -> bool:
+        res = await self.bot_admins.update_one({"_id": int(user_id)},
+                                               {"$setOnInsert": {"by": int(by), "name": name, "at": utcnow()}},
+                                               upsert=True)
+        return res.upserted_id is not None
+
+    async def remove_bot_admin(self, user_id: int) -> bool:
+        return (await self.bot_admins.delete_one({"_id": int(user_id)})).deleted_count > 0
+
+    async def list_bot_admins(self) -> List[dict]:
+        return await self.bot_admins.find({}).to_list(length=200)
+
+    # ------------------------------------------- auto-delete queue (AutoAnime)
+    async def queue_autodelete(self, chat_id: int, message_ids: List[int], delete_at) -> None:
+        await self.autodelete.insert_one({"chat_id": int(chat_id), "message_ids": [int(x) for x in message_ids],
+                                          "delete_at": delete_at, "created_at": utcnow()})
+
+    async def due_autodeletes(self, now, limit: int = 100) -> List[dict]:
+        return await self.autodelete.find({"delete_at": {"$lte": now}}).sort("delete_at", 1).to_list(length=limit)
+
+    async def done_autodelete(self, doc_id) -> None:
+        await self.autodelete.delete_one({"_id": doc_id})
+
+    # ----------------------------------------- mapped channels (AutoAnime)
+    async def map_channel(self, channel_id: int, anime_id: int) -> None:
+        await self.mapped_channels.update_one({"_id": int(channel_id)},
+                                              {"$addToSet": {"anime_ids": int(anime_id)},
+                                               "$set": {"updated_at": utcnow()}}, upsert=True)
+
+    async def unmap_channel(self, channel_id: int, anime_id: Optional[int] = None) -> bool:
+        if anime_id is None:
+            return (await self.mapped_channels.delete_one({"_id": int(channel_id)})).deleted_count > 0
+        res = await self.mapped_channels.update_one({"_id": int(channel_id)}, {"$pull": {"anime_ids": int(anime_id)}})
+        await self.mapped_channels.delete_one({"_id": int(channel_id), "anime_ids": {"$size": 0}})
+        return res.modified_count > 0
+
+    async def channels_for_anime(self, anime_id: int) -> List[int]:
+        return [d["_id"] async for d in self.mapped_channels.find({"anime_ids": int(anime_id)}, {"_id": 1})]
+
+    async def list_mappings(self) -> List[dict]:
+        return await self.mapped_channels.find({}).to_list(length=500)
+
+    async def claim_mapped_post(self, key: str, chat_id: int) -> bool:
+        """Once per episode per mapped channel (safe across retries and dynos)."""
+        from pymongo.errors import DuplicateKeyError
+        try:
+            await self.mapped_posts.insert_one({"_id": f"{key}@{int(chat_id)}", "episode_key": key,
+                                                "chat_id": int(chat_id), "state": "posting", "at": utcnow()})
+            return True
+        except DuplicateKeyError:
+            return False
+
+    async def finish_mapped_post(self, key: str, chat_id: int, message_id: Optional[int], error: str = None) -> None:
+        if error:   # allow a later retry
+            await self.mapped_posts.delete_one({"_id": f"{key}@{int(chat_id)}"})
+            return
+        await self.mapped_posts.update_one({"_id": f"{key}@{int(chat_id)}"},
+                                           {"$set": {"state": "published", "message_id": message_id}})
+
+    # ------------------------------------------------- public library search
+    async def search_anime(self, text: str, limit: int = 8) -> List[dict]:
+        import re as _re
+        rx = {"$regex": _re.escape(text.strip()[:60]), "$options": "i"}
+        q = {"$or": [{"title_romaji": rx}, {"title_english": rx}, {"title_native": rx}, {"synonyms": rx}]}
+        return await self.anime.find(q).sort("title_romaji", 1).to_list(length=limit)
+
+    async def published_episodes(self, anime_id: int, limit: int = 100) -> List[dict]:
+        return await self.episodes.find({"anime_id": int(anime_id), "state": M.PUBLISHED, "token": {"$ne": None}},
+                                        {"episode": 1, "token": 1}).sort("episode", 1).to_list(length=limit)
 
 
 def _aware(dt):
