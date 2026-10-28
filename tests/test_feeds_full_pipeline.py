@@ -164,7 +164,7 @@ def fake_download(monkeypatch, tmp_path):
         shutil.copy(clip["path"], dest)
         import hashlib
         return ns.DownloadResult(dest, os.path.getsize(dest), hashlib.sha256(open(dest, "rb").read()).hexdigest())
-    monkeypatch.setattr(pipeline_mod, "download", dl)
+    monkeypatch.setattr(ns, "download", dl)          # used by SourceAdapter.download()
     return calls, clip
 
 

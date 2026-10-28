@@ -19,13 +19,14 @@ from .config import Config
 from .db import AnimeDB
 from . import processing
 from .captions import human_size
-from .netsafe import DownloadError, UnsafeURL, download, make_session
+from .netsafe import DownloadError, UnsafeURL, make_session
 from .publisher import AmbiguousPublish, publish
 from .sources import SourceItem, SourceRegistry
 from .tg import Notifier, esc
 from .timeutil import utcnow
 from .uploader import UploadError, upload_episode
-from .validate import InvalidFile, validate_video
+from .sources.base import TransferContext
+from .validate import InvalidFile, sha256_file, validate_video
 
 log = logging.getLogger(__name__)
 PERMISSION_ERRORS = (ChatAdminRequired, ChatWriteForbidden, ChannelPrivate, ChannelInvalid, PeerIdInvalid)
@@ -109,14 +110,31 @@ class Pipeline:
                     await self.db.set_state(key, M.UPLOADING, local_path=None, source_path=None, container=None)
                     state = M.UPLOADING
                 else:
-                    await self.db.set_state(key, M.DOWNLOADING)
+                    await self.db.set_state(key, M.DOWNLOADING, download_sha256=None)
                     src = await self._obtain(key, item)
-                    await validate_video(src, min_bytes=self.cfg.min_file_size_bytes,
-                                         max_bytes=self.cfg.max_file_size_bytes, expected_size=item.size,
-                                         expected_sha256=item.sha256,
-                                         actual_sha256=(await self.db.get_episode(key) or {}).get("download_sha256"))
-                    await self.db.set_state(key, M.PROCESSING, source_path=src)
-                    state = M.PROCESSING
+                    await self.db.set_state(key, M.VALIDATING, source_path=src)
+                    state = M.VALIDATING
+
+            # 2b) validate the downloaded file before FFmpeg touches it (size, checksum, container,
+            #     duration). A mismatch rejects this candidate (VALIDATION_FAILED) — it is never uploaded.
+            if state == M.VALIDATING:
+                fresh = await self.db.get_episode(key)
+                src = fresh.get("source_path")
+                if not (src and os.path.isfile(src)):
+                    await self.db.set_state(key, M.AVAILABLE, source_path=None, local_path=None)
+                    await self.db.release(key, next_attempt_at=utcnow())
+                    return M.AVAILABLE
+                adapter = self.sources.adapter_for(item)
+                report = await adapter.validate(item, src, self._transfer_ctx(key),
+                                                actual_sha256=fresh.get("download_sha256"))
+                digest = fresh.get("download_sha256") or await asyncio.to_thread(sha256_file, src)
+                await self.db.set_state(key, M.PROCESSING, download_sha256=digest,
+                                        validation={"size": report.size, "container": report.container,
+                                                    "duration": report.duration, "sha256": digest,
+                                                    "expected_sha256": item.sha256, "expected_size": item.size})
+                await self.db.event(key, "validated", size=report.size, container=report.container,
+                                    checksum_verified=bool(item.sha256))
+                state = M.PROCESSING
 
             # 3) FFprobe validation + optional remux/transcode (source kept until upload succeeds)
             if state == M.PROCESSING:
@@ -146,6 +164,17 @@ class Pipeline:
                     await self.db.release(key, next_attempt_at=utcnow())
                     return back
                 if not fresh.get("storage"):
+                    prior = await self.db.get_upload(key)
+                    if prior and prior.get("status") == "stored" and prior.get("file_id"):
+                        # Telegram already confirmed this upload (crash before the state was saved):
+                        # reuse it instead of uploading a duplicate.
+                        fresh["storage"] = {"chat_id": prior.get("storage_chat_id"), "message_id": prior["message_id"],
+                                            "file_id": prior["file_id"], "file_unique_id": prior.get("file_unique_id"),
+                                            "file_size": prior.get("file_size"), "media_type": prior.get("media_type"),
+                                            "quality": prior.get("quality"), "source": item.source}
+                        await self.db.set_state(key, M.UPLOADED, storage=fresh["storage"],
+                                                token=fresh.get("token") or M.new_episode_token())
+                if not fresh.get("storage"):
                     storage = await upload_episode(
                         self.client, self.cfg.storage_channel_id, key, anime, doc["episode"], item,
                         local_path if item.kind != "telegram" or local_path else None,
@@ -153,9 +182,13 @@ class Pipeline:
                         media=fresh.get("media"),
                         keepalive=lambda: self.db.renew_lease(key, self.cfg.job_lease_seconds))
                     token = fresh.get("token") or M.new_episode_token()
+                    # Telegram returned the stored message (verified media + size) — record it first.
+                    await self.db.record_upload(key, storage, quality=storage.get("quality") or item.quality,
+                                                language=item.language, sha256=fresh.get("download_sha256"),
+                                                source_id=item.source_id)
                     await self.db.set_state(key, M.UPLOADED, storage=storage, token=token, attempts=0,
                                             last_error=None)
-                else:
+                elif fresh.get("state") != M.UPLOADED:
                     await self.db.set_state(key, M.UPLOADED)
                 # Only now — after Telegram confirmed the upload — remove temporary files.
                 self._cleanup_job(key, item, fresh)
@@ -166,7 +199,9 @@ class Pipeline:
             if state == M.UPLOADED:
                 doc = await self.db.get_episode(key)
                 msg_id = await publish(self.client, self.db, self.cfg, anime, doc, await self.bot_username())
-                await self.db.set_state(key, M.PUBLISHED, post_message_id=msg_id, attempts=0, last_error=None)
+                await self.db.set_state(key, M.PUBLISHED, post_message_id=msg_id, attempts=0, last_error=None,
+                                        failure_code=None)
+                await self.db.mark_upload_status(key, "published")
                 await self.db.release(key)
                 log.info("Published %s", key)
                 return M.PUBLISHED
@@ -195,7 +230,16 @@ class Pipeline:
     def _job_dir(self, key: str) -> str:
         return os.path.join(self.cfg.download_dir, key.replace(":", "_"))
 
+    def _transfer_ctx(self, key: str) -> TransferContext:
+        def http():
+            if self._http is None or self._http.closed:
+                self._http = make_session()
+            return self._http
+        return TransferContext(cfg=self.cfg, http=http, client=self.client,
+                               keepalive=lambda: self.db.renew_lease(key, self.cfg.job_lease_seconds))
+
     async def _obtain(self, key: str, item: SourceItem) -> str:
+        """Download through the item's source adapter. Returns the local path."""
         if item.kind == "local":
             if not os.path.isfile(item.ref):
                 raise DownloadError("Local source file disappeared")
@@ -204,24 +248,12 @@ class Pipeline:
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", item.file_name)[-120:] or "episode.bin"
         dest = os.path.join(job_dir, "src_" + safe_name)
         processing.ensure_disk(job_dir, int(item.size or 0), self.cfg.disk_headroom_mb)
-        if item.kind == "telegram":
-            path = await asyncio.wait_for(
-                self.client.download_media(item.ref, file_name=dest), timeout=self.cfg.download_timeout_seconds)
-            if not path or not os.path.isfile(path):
-                raise DownloadError("Telegram download returned no file")
-            return path
-        if item.kind != "url":
-            raise DownloadError(f"Unsupported item kind {item.kind}", transient=False)
-        if self._http is None or self._http.closed:
-            self._http = make_session()
-        adapter = self.sources.adapter_by_name(item.source)
-        headers = adapter.headers() if adapter is not None and hasattr(adapter, "headers") else None
-        res = await download(self._http, item.ref, dest, self.cfg.allowed_source_hosts,
-                             allow_http=self.cfg.allow_http_sources, max_bytes=self.cfg.max_file_size_bytes,
-                             timeout_s=self.cfg.download_timeout_seconds, headers=headers,
-                             on_progress=lambda _n: self.db.renew_lease(key, self.cfg.job_lease_seconds))
-        await self.db.episodes.update_one({"_id": key}, {"$set": {"download_sha256": res.sha256}})
-        return res.path
+        os.makedirs(job_dir, exist_ok=True)
+        out = await self.sources.adapter_for(item).download(item, dest, self._transfer_ctx(key))
+        if out.sha256:
+            await self.db.episodes.update_one({"_id": key}, {"$set": {"download_sha256": out.sha256}})
+        await self.db.event(key, "downloaded", size=out.size, source_id=item.source_id)
+        return out.path
 
     def _safe_remove(self, path: Optional[str]) -> None:
         if not path:
@@ -302,6 +334,11 @@ class Pipeline:
         stage = state
         msg = f"{type(exc).__name__}: {exc}"
         await self.db.record_error(key, stage, msg, attempts)
+        code = M.VALIDATION_FAILED if isinstance(exc, InvalidFile) else \
+            M.PUBLISH_FAILED if isinstance(exc, AmbiguousPublish) else M.failure_code_for(stage)
+        await self.db.episodes.update_one({"_id": key}, {"$set": {
+            "failure_code": code, "failed_stage": stage, "last_failure_at": utcnow()}})
+        await self.db.event(key, "error", failure_code=code, stage=stage, attempt=attempts, error=msg[:300])
         log.warning("Episode %s failed at %s (attempt %s): %s", key, stage, attempts, msg)
         title = esc(anime.get("title_romaji", key))
 
@@ -336,14 +373,15 @@ class Pipeline:
                 await self.db.episodes.update_one({"_id": key}, {"$set": {"local_path": None, "source_path": None}})
             await self.db.set_state(key, M.FAILED, attempts=attempts, last_error=msg)
             await self.db.release(key)
-            await self.notifier.alert(f"❌ <b>{title}</b> ep {doc['episode']} failed after {attempts} attempts: "
+            await self.notifier.alert(f"❌ <b>{code}</b> — <b>{title}</b> ep {doc['episode']} failed after {attempts} attempts: "
                                       f"{esc(msg)}\nUse /retry {esc(key)}")
             return M.FAILED
         # Transient: keep state (download restarts from scratch; upload is skipped if already stored).
         back_state = state if state in M.WORKABLE_STATES else M.AIRING
         if back_state == M.DOWNLOADING:
             back_state = M.AVAILABLE
-        if back_state == M.PROCESSING and not (fresh.get("source_path") and os.path.isfile(fresh["source_path"])):
+        if back_state in (M.VALIDATING, M.PROCESSING) and not (fresh.get("source_path")
+                                                                and os.path.isfile(fresh["source_path"])):
             back_state = M.AVAILABLE
         await self.db.release(key, state=back_state, attempts=attempts, last_error=msg,
                               next_attempt_at=utcnow() + timedelta(seconds=backoff_seconds(attempts)))
