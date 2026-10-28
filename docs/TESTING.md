@@ -1,5 +1,29 @@
 # Testing report and live demonstration checklist
 
+## Update — AutoAnime.zip integration (28 Oct 2026, branch `feature/autoanime-integration`)
+
+`python -m pytest -q` → **237 passed, 4 skipped** (mongomock). With a real MongoDB 7.0
+(`REAL_MONGODB_URI=mongodb://127.0.0.1:27099`) → **241 passed**. `pyflakes anime_soul tests main.py` clean.
+
+New `tests/test_autoanime_features.py` (24 tests):
+- **bans** block `/start` links, TRY AGAIN, file sharing, `/search`, `/ongoing` and search buttons; unban restores the old link; admins can't be banned; users can't ban;
+- **admins**: `/addadmin` is owner-only, an added admin passes the admin guard but can't add admins, the list survives a restart (MongoDB), env owners can't be removed;
+- **/manage**: non-admins are refused (command and `mng:` callback); pause / dry run / auto-delete presets / mapped toggles saved;
+- **auto-delete**: off by default; admins exempt; the minimum is enforced; queued delivery + notice deleted only when due (time-shifted sweep, i.e. after a restart); a delete error doesn't block the queue;
+- `/ping`; `/restart` is admin-only, sets the stop event and the restart flag, then the message is edited once after the restart;
+- `/stats` keeps the original first line and adds details; the command menu has separate public and admin scopes, a failure never raises, and help stays under 4096 characters; `START_PICS` is optional (default text unchanged);
+- **/search** returns EP buttons that are the existing deep links (`?start=<token>`), unpublished episodes have no button, pagination works and the regex is escaped; `/ongoing` works;
+- **mapped channels**: `/setmap` requires the bot to be admin and refuses the post/storage channel; a failed post is released for retry, one post per channel per episode, and posting can be switched off; **full pipeline**: one main post + one mapped post, no duplicates after a retry/restart; a mapped-post crash does not fail the episode;
+- **HLS**: master parsing and quality pick; AES-128, SAMPLE-AES and SESSION-KEY refused; live (no ENDLIST), too many segments and non-HLS refused; a segment on a host outside the allowlist refused; size cap enforced with no output left behind; **real FFmpeg remux** of locally generated HLS segments into a ~6 s MKV with progress, temp dir cleaned; a JSON feed item with `format: hls` is marked and routed to the HLS downloader.
+
+Two bugs were found by these tests and fixed: mapped posts read the wrong database object, and the HLS
+output folder wasn't created.
+
+Remaining integration tests (need your accounts, not run here): a real `/restart` on Heroku (re-exec in the
+dyno), the command menu showing in Telegram, auto-delete on a real chat, `/setmap` with a real channel, and a
+real licensed provider's HLS stream (host reachability, segment content types). No live Telegram, Heroku or
+provider test was done for this branch.
+
 ## Update — Telegram provider channel source (28 Oct 2026, branch `feature/telegram-channel-source`)
 
 `python -m pytest -q` → **213 passed, 4 skipped** (mongomock). With a real MongoDB 7.0
