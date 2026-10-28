@@ -33,12 +33,16 @@ address bar) on Heroku and MongoDB pages if a button is hidden.
 4. *Network Access* → *Add IP address* → **Allow access from anywhere** (`0.0.0.0/0`). Heroku dyno IPs change, so this is required; the password protects access.
 5. *Clusters* → *Connect* → *Drivers* → copy the `mongodb+srv://…` string and put your password in it. That's `MONGODB_URI`.
 6. Nothing else to create: the bot creates its collections and indexes on first start
-   (`files`, `anime`, `episodes`, `posts`, `caption_templates`, `sources`, `settings`, `job_errors`, `users`, `fsub_requests`, `inbox`).
+   (`files`, `anime`, `episodes`, `posts`, `caption_templates`, `sources`, `settings`, `job_errors`, `users`, `fsub_requests`, `inbox`,
+   and since Oct 2026 `episode_releases`, `telegram_uploads`, `pipeline_events`). New indexes are added
+   automatically on start-up; existing documents are not changed.
+7. Atlas Free (M0) is enough: only metadata is stored (videos live in Telegram). `pipeline_events` deletes
+   itself after 60 days (TTL index).
    Existing share links in `files` keep working if you reuse the same database.
 
 ## 3. GitHub (Safari or GitHub app)
 
-The new code is on branch **`feature/anime-soul-full-pipeline`** (pull request into `main`). You can either:
+The newest code is on branch **`feature/ongoing-release-system`** (pull request into `main`). You can either:
 - deploy that branch directly (Heroku step 4), or
 - merge it: GitHub app → repository → *Pull requests* → open the PR → review → *Merge*.
 
@@ -70,7 +74,7 @@ The new code is on branch **`feature/anime-soul-full-pipeline`** (pull request i
    It installs `ffmpeg` and `ffprobe` (FFmpeg 7.1 on heroku-24). Without it `/status` shows
    `FFmpeg: MISSING` and, with `FFMPEG_REQUIRED=true`, nothing is uploaded.
 4. **Deploy** tab → *Deployment method* **GitHub** → connect → search `chatgptfilesharebot` → *Connect*.
-   *Manual deploy* → choose branch `feature/anime-soul-full-pipeline` (or `main` after merging) → **Deploy Branch**. Wait for "Your app was successfully deployed".
+   *Manual deploy* → choose branch `main` (after merging the pull request) → **Deploy Branch**. Wait for "Your app was successfully deployed".
 5. **Resources** tab → click the pencil on `worker: python main.py` → switch **on** → Confirm.
    Leave `uploader` **off** (only used in split mode, below). There is no web dyno; that's expected.
 6. Logs: *More → View logs*. You should see `Started as @YourBot (role=all, dry_run=True)`.
@@ -100,6 +104,37 @@ Never scale `worker` above 1 — Telegram allows only one process to receive a b
   disk size, so the bot checks free space before every download/encode (`DISK_HEADROOM_MB`). The source
   file is kept until the Telegram upload is confirmed; then temp files are deleted. If a restart happens
   mid-way it re-downloads automatically. Permanent storage is the Telegram storage channel + MongoDB.
+
+### Updating your existing app `autoanimebotu` (iPhone, about 5 minutes)
+1. GitHub app → `Ic34al/chatgptfilesharebot` → **Pull requests** → *Ongoing-release system* → read
+   **Files changed** → **Merge pull request** → Confirm.
+2. Safari (Desktop Website) → Heroku → `autoanimebotu` → **Settings → Config Vars**. **Don't change existing values.**
+   Optional new ones (all have safe defaults, so you can skip this step):
+   `SCHEDULE_POST_ENABLED=false`, `SCHEDULE_POST_TIME=00:30`, `SCHEDULE_CHANNEL_ID` (empty = post channel),
+   `RECONCILE_MAX_HOURS=168`, `FEED_ALERT_AFTER_FAILURES=5`. Leave `DRY_RUN=true`.
+3. **Settings → Buildpacks**: check that `heroku-buildpack-activestorage-preview` is listed **above**
+   `heroku/python` (gives ffmpeg + ffprobe).
+4. **Deploy → Manual deploy** → branch `main` → **Deploy Branch** → wait for "successfully deployed".
+5. **Resources**: `worker` on (1 dyno), `uploader` off.
+6. **More → View logs**: look for `MongoDB reachable (… ms)` and `Started as @YourBot (role=all, dry_run=True)`.
+   `Cannot reach MongoDB` → see Troubleshooting.
+7. In Telegram send `/status`. You should see the MongoDB ping, free temp disk, pipeline counts, failure codes and
+   each feed's last success. Then `/schedule` and `/queue`.
+
+### Is the Heroku plan suitable?
+| Plan | Verdict |
+|---|---|
+| **Eco** ($5, 1000 hours/month shared by all Eco dynos, 0.5 GB) | Works for testing. One 24/7 worker uses about 744 h, so a second Eco app or the `uploader` dyno will run out of hours. When hours run out, all Eco dynos sleep for the rest of the month. |
+| **Basic** ($7/dyno, 0.5 GB, always on) | **Recommended** for `PROCESS_MODE=auto` (remux only) and `MAX_CONCURRENT_JOBS=1`. |
+| **Standard-2X** ($50, 1 GB) | Only if you need transcoding (`PROCESS_MODE=transcode` / `MAX_OUTPUT_HEIGHT`). |
+
+Limits that apply on every plan:
+- The disk is temporary. It is wiped on every restart (at least once a day), and Heroku does not publish its size.
+- The bot checks free space before each download.
+- Jobs and history are kept in MongoDB, never on disk, so a restart only means re-downloading the file in progress.
+- Telegram bot uploads are limited to 2000 MB per file.
+- Feeds only list their newest entries, so long outages can still miss releases. You will get a "may be missing" alert when that happens.
+- Uninterrupted uploads and complete release coverage **can't be guaranteed**. Restarts, Telegram rate limits, source outages and unannounced delays all happen.
 
 ## 5. First run (in Telegram, as the owner)
 ```
@@ -160,6 +195,11 @@ Test the whole path safely first:
 | `FloodWait` in logs | Telegram rate limit; the bot waits and continues automatically. |
 | MongoDB `ServerSelectionTimeoutError` | Atlas Network Access must include `0.0.0.0/0`; check the password in `MONGODB_URI` (URL-encode special characters). |
 | Worker sleeps / stops | Eco dynos share 1000 h/month across the account; use Basic for 24/7. |
+| `Cannot reach MongoDB (…)` in logs, worker exits | Atlas *Network Access* needs `0.0.0.0/0`; re-check `MONGODB_URI` (the URI is never printed in logs). |
+| `/status` shows a feed `ERROR · backoff until …` | The feed failed several times in a row. The bot retries automatically (60 s doubling up to 1 h). Check the URL with `/sources check`. |
+| Alert "Releases published in between may be missing" | The bot was offline longer than the feed's history. Check the partner's site and `/attach` any missed episode. |
+| `📦 Could not deliver …` alert | The storage message was deleted or is inaccessible. Run `/checkfiles`, then `/reupload <key>`. The post and link stay the same. |
+| `/queue` shows `VALIDATION_FAILED` | Size/checksum/container/duration check failed. The file was not uploaded; the bot waits for a valid file. |
 | Build fails on Python version | Keep `.python-version` = `3.11`; delete any `runtime.txt`. |
 
 ## Paid services and platform limits
