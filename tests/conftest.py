@@ -152,6 +152,14 @@ class FakeClient:
             raise UserNotParticipant()
         return SimpleNamespace(status=v, is_member=True)
 
+    async def get_messages(self, chat_id, message_ids):
+        """Storage-channel lookup used by /checkfiles. ids in self.deleted come back empty."""
+        self.calls.append(("get_messages", chat_id, message_ids))
+        self._maybe_fail("get_messages")
+        if message_ids in getattr(self, "deleted", set()):
+            return SimpleNamespace(id=message_ids, empty=True, video=None, document=None, animation=None)
+        return SimpleNamespace(id=message_ids, empty=False, video=Media(file_id="F"), document=None, animation=None)
+
     async def get_chat(self, chat):
         return SimpleNamespace(id=chat if isinstance(chat, int) else -100555, title="ANIME SOUL", username=None)
 

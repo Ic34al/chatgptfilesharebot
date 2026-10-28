@@ -353,8 +353,8 @@ class SourceRegistry:
         self._loaded_at = 0.0
         self._retry_at: Dict[str, object] = {}     # source name -> datetime (backoff until)
 
-    async def adapters(self) -> List[SourceAdapter]:
-        if time.monotonic() - self._loaded_at > 60:
+    async def adapters(self, force: bool = False) -> List[SourceAdapter]:
+        if force or time.monotonic() - self._loaded_at > 60:
             docs = await self.db.list_sources(enabled_only=True)
             fresh: Dict[str, SourceAdapter] = {}
             self._retry_at = {d["_id"]: d.get("retry_at") for d in docs if d.get("retry_at")}

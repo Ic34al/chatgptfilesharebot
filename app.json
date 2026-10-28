@@ -108,6 +108,11 @@
     "MAX_CONCURRENT_JOBS": {
       "description": "Episodes processed at the same time",
       "value": "1"
+    },
+    "SCHEDULE_POST_ENABLED": {
+      "description": "Post today's airing timetable (IST) once a day. In dry run it is sent to admins only.",
+      "value": "false",
+      "required": false
     }
   }
 }
